@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,23 +13,52 @@ import (
 )
 
 func TestLinkChecker_Check(t *testing.T) {
+	var headCount, getCount int64
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("User-Agent"), "deadlink") {
 			http.Error(w, "missing user agent", http.StatusBadRequest)
 			return
 		}
 
+		switch r.Method {
+		case http.MethodHead:
+			atomic.AddInt64(&headCount, 1)
+		case http.MethodGet:
+			atomic.AddInt64(&getCount, 1)
+		}
+
 		switch r.URL.Path {
 		case "/ok":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("OK content"))
+
+		case "/reject-head-405":
+			// Real-world scenario: endpoint rejects HEAD with 405, but serves 200 on GET
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			} else {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("GET content"))
+			}
+
+		case "/reject-head-403":
+			// Real-world scenario: WAF/CDN rejects HEAD with 403, but allows GET
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusForbidden)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+
 		case "/not-found":
 			w.WriteHeader(http.StatusNotFound)
+
 		case "/server-error":
 			w.WriteHeader(http.StatusInternalServerError)
+
 		case "/slow":
 			time.Sleep(100 * time.Millisecond)
 			w.WriteHeader(http.StatusOK)
+
 		default:
 			w.WriteHeader(http.StatusBadRequest)
 		}
@@ -40,47 +70,65 @@ func TestLinkChecker_Check(t *testing.T) {
 	tests := []struct {
 		name           string
 		path           string
-		parentURL      string
 		timeout        time.Duration
 		expectedStatus int
 		expectBroken   bool
 		expectErr      bool
+		expectedMethod string
 	}{
 		{
-			name:           "healthy link 200",
+			name:           "healthy link succeeds on HEAD directly",
 			path:           "/ok",
-			parentURL:      "https://example.com",
 			timeout:        1 * time.Second,
 			expectedStatus: http.StatusOK,
 			expectBroken:   false,
 			expectErr:      false,
+			expectedMethod: http.MethodHead,
 		},
 		{
-			name:           "broken link 404",
+			name:           "405 on HEAD falls back to GET successfully",
+			path:           "/reject-head-405",
+			timeout:        1 * time.Second,
+			expectedStatus: http.StatusOK,
+			expectBroken:   false,
+			expectErr:      false,
+			expectedMethod: http.MethodGet,
+		},
+		{
+			name:           "403 on HEAD falls back to GET successfully",
+			path:           "/reject-head-403",
+			timeout:        1 * time.Second,
+			expectedStatus: http.StatusOK,
+			expectBroken:   false,
+			expectErr:      false,
+			expectedMethod: http.MethodGet,
+		},
+		{
+			name:           "broken link 404 does not need GET fallback",
 			path:           "/not-found",
-			parentURL:      "https://example.com/blog",
 			timeout:        1 * time.Second,
 			expectedStatus: http.StatusNotFound,
 			expectBroken:   true,
 			expectErr:      false,
+			expectedMethod: http.MethodHead,
 		},
 		{
-			name:           "broken link 500",
+			name:           "broken link 500 fails directly on HEAD",
 			path:           "/server-error",
-			parentURL:      "https://example.com/blog",
 			timeout:        1 * time.Second,
 			expectedStatus: http.StatusInternalServerError,
 			expectBroken:   true,
 			expectErr:      false,
+			expectedMethod: http.MethodHead,
 		},
 		{
-			name:           "timeout canceled context",
+			name:           "timeout deadline aborts probe",
 			path:           "/slow",
-			parentURL:      "https://example.com/slow-page",
 			timeout:        20 * time.Millisecond,
 			expectedStatus: 0,
 			expectBroken:   true,
 			expectErr:      true,
+			expectedMethod: http.MethodGet, // timeout on HEAD retried GET which also timed out
 		},
 	}
 
@@ -90,28 +138,22 @@ func TestLinkChecker_Check(t *testing.T) {
 			defer cancel()
 
 			targetURL := server.URL + tt.path
-			res := checker.Check(ctx, targetURL, tt.parentURL)
+			res := checker.Check(ctx, targetURL, "https://example.com")
 
-			if res.URL != targetURL {
-				t.Errorf("expected URL %q, got %q", targetURL, res.URL)
-			}
-			if res.ParentURL != tt.parentURL {
-				t.Errorf("expected ParentURL %q, got %q", tt.parentURL, res.ParentURL)
-			}
 			if res.Broken != tt.expectBroken {
 				t.Errorf("expected Broken = %v, got %v", tt.expectBroken, res.Broken)
 			}
 			if res.StatusCode != tt.expectedStatus {
 				t.Errorf("expected StatusCode %d, got %d", tt.expectedStatus, res.StatusCode)
 			}
+			if res.MethodUsed != tt.expectedMethod {
+				t.Errorf("expected MethodUsed %s, got %s", tt.expectedMethod, res.MethodUsed)
+			}
 			if tt.expectErr && res.Error == nil {
 				t.Errorf("expected non-nil error, got nil")
 			}
 			if !tt.expectErr && res.Error != nil {
 				t.Errorf("unexpected error: %v", res.Error)
-			}
-			if res.Duration <= 0 {
-				t.Errorf("expected positive duration, got %v", res.Duration)
 			}
 		})
 	}

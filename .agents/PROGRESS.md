@@ -443,3 +443,69 @@ In Chunk 1.6, we completed the verification suite for the entire Stage 1 (CLI MV
   - ✅ Deadlock-free worker pool & visited set coordinator (`crawler.go`)
   - ✅ CLI entrypoint with live progress, signal handling, and exit codes (`main.go`)
   - ✅ Black-box integration tests & race detector verification (`crawler_test.go`, `cli_test.go`)
+
+---
+
+## Stage 2: Robustness
+
+### Chunk 2.1: HEAD -> GET Fallback
+**File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go)  
+**Tests**: [`internal/crawler/test/checker_test.go`](../internal/crawler/test/checker_test.go)
+
+#### 1. What was built & Why
+In theory, HTTP `HEAD` is the ideal method for link checking: it asks the web server to return headers and status codes identical to a `GET`, but without transmitting the response body. This saves enormous network bandwidth when probing thousands of links.
+However, in production, real-world servers and CDNs are notoriously non-compliant:
+- Many frameworks, microservices, and static servers return `405 Method Not Allowed` or `501 Not Implemented` for `HEAD`.
+- Some Web Application Firewalls (Cloudflare, AWS WAF, Akamai) treat `HEAD` requests as automated scanning probes and reject them with `403 Forbidden`.
+- Certain legacy web servers close the TCP connection (TCP RST) upon receiving `HEAD`.
+- **Solution**:
+  - `LinkChecker.Check` now issues a lightweight `HEAD` request first.
+  - If the server accepts `HEAD` (< 400), the probe completes with zero body transfer.
+  - If the server rejects `HEAD` with `405`, `501`, `403`, or a transport error, the checker automatically falls back to an HTTP `GET` with bounded body reading (`io.LimitReader(body, 4096)`) before marking the link dead.
+  - Definite failures (such as `404 Not Found` or `410 Gone`) do not trigger a wasteful GET retry.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### HTTP Request Mutation & Header Re-use
+- In Go, `http.Request` structs are mutable. However, once passed to `client.Do(req)`, the internal transport consumes fields like `Body` and state tokens.
+- We encapsulated request creation into a helper:
+  ```go
+  func (c *LinkChecker) doRequest(ctx context.Context, method, targetURL string) (*http.Response, error)
+  ```
+  This cleanly isolates the generation of separate `HEAD` and `GET` requests while preserving headers (`User-Agent`) and context cancellation.
+
+##### Selective Fallback Control Flow
+- Using a clean predicate function `shouldFallbackToGET(statusCode int) bool` centralizes policy:
+  ```go
+  switch statusCode {
+  case http.StatusMethodNotAllowed, http.StatusNotImplemented, http.StatusForbidden:
+      return true
+  default:
+      return false
+  }
+  ```
+  In C++, this maps to a switch on `http_status_code` enum. In Rust, this maps to `match status { StatusCode::METHOD_NOT_ALLOWED | ... => true, _ => false }`.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| HTTP `HEAD` vs `GET` | `curl_easy_setopt(curl, CURLOPT_NOBODY, 1L)` vs standard GET | `reqwest::Client::head()` vs `reqwest::Client::get()` |
+| `drainAndClose(body)` | RAII reader with fixed-buffer consume + socket close | `body.take(4096).read_to_end()` + `drop(body)` |
+| `Result.MethodUsed` | Status telemetry tag | Field on result struct / enum variant |
+
+---
+
+#### 4. API Inventory (Updated in Chunk 2.1)
+
+- **Struct Updates**:
+  - `Result.MethodUsed string`: Telemetry field recording whether availability was verified via `"HEAD"` or `"GET"` fallback.
+- **Methods Added / Modified**:
+  - `(c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result`: Upgraded to HEAD-first with automatic GET fallback.
+  - `(c *LinkChecker) doRequest(ctx, method, targetURL) (*http.Response, error)`: Helper for executing context-aware HTTP requests.
+  - `(c *LinkChecker) drainAndClose(body io.ReadCloser)`: Consumes up to 4KB of response body and safely closes socket file descriptor.
+  - `shouldFallbackToGET(statusCode int) bool`: Predicate determining whether status code warrants GET retry.

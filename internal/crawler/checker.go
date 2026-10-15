@@ -18,6 +18,7 @@ type Result struct {
 	Duration   time.Duration `json:"duration_ms"`
 	Error      error         `json:"error,omitempty"`
 	Broken     bool          `json:"broken"`
+	MethodUsed string        `json:"method_used,omitempty"` // "HEAD" or "GET" (fallback)
 }
 
 // LinkChecker encapsulates the HTTP client and configuration for probing links.
@@ -26,7 +27,7 @@ type LinkChecker struct {
 	userAgent string
 }
 
-// NewLinkChecker constructs a LinkChecker. If client is nil, http.DefaultClient is used.
+// NewLinkChecker constructs a LinkChecker. If client is nil, a sane default is provided.
 func NewLinkChecker(client *http.Client, userAgent string) *LinkChecker {
 	if client == nil {
 		client = &http.Client{
@@ -43,7 +44,9 @@ func NewLinkChecker(client *http.Client, userAgent string) *LinkChecker {
 }
 
 // Check probes targetURL with an HTTP request and returns a Result.
-// It leverages context.Context for cancellation and timeouts.
+// It uses a HEAD-first strategy: sends a cheap HEAD request, and if the target
+// server rejects it (405 Method Not Allowed, 501 Not Implemented) or returns 403,
+// it automatically falls back to a GET request before declaring the link dead.
 func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result {
 	start := time.Now()
 	res := Result{
@@ -51,46 +54,94 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 		ParentURL: parentURL,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		res.Duration = time.Since(start)
-		res.Error = err
-		res.Broken = true
-		return res
+	// Step 1: Issue cheap HEAD request (header probe, no body transfer)
+	resp, err := c.doRequest(ctx, http.MethodHead, targetURL)
+	if err == nil {
+		res.StatusCode = resp.StatusCode
+		res.MethodUsed = http.MethodHead
+
+		// Clean up socket descriptor and drain
+		c.drainAndClose(resp.Body)
+
+		// If HEAD succeeded with a 2xx or 3xx status, link is healthy!
+		if resp.StatusCode < 400 {
+			res.Duration = time.Since(start)
+			res.Broken = false
+			return res
+		}
+
+		// If the server rejected HEAD specifically with:
+		// - 405 Method Not Allowed
+		// - 501 Not Implemented
+		// - 403 Forbidden (some WAFs/CDNs block HEAD but allow GET)
+		// we must not declare it dead yet: retry with GET!
+		if !shouldFallbackToGET(resp.StatusCode) {
+			// Definite failure like 404 Not Found, 410 Gone, or 500 Server Error
+			res.Duration = time.Since(start)
+			res.Broken = true
+			return res
+		}
 	}
 
-	req.Header.Set("User-Agent", c.userAgent)
-
-	resp, err := c.client.Do(req)
+	// Step 2: Fallback to GET
+	// Reached if HEAD returned 405/501/403 OR if HEAD encountered a network transport error
+	getResp, getErr := c.doRequest(ctx, http.MethodGet, targetURL)
 	res.Duration = time.Since(start)
+	res.MethodUsed = http.MethodGet
 
-	if err != nil {
-		// Network-level error: DNS failure, connection refused, TLS handshake error, or timeout.
-		res.Error = err
+	if getErr != nil {
+		// Both HEAD and GET failed
+		if err != nil {
+			res.Error = err
+		} else {
+			res.Error = getErr
+		}
 		res.Broken = true
 		return res
 	}
 
-	// CRITICAL RESOURCE LIFECYCLE (Go defer mechanics):
-	// Go does not have C++ RAII destructors. If resp.Body is not explicitly closed,
-	// the underlying operating system file descriptor (socket) leaks. Over thousands
-	// of links, this would trigger 'too many open files' (EMFILE).
-	// defer ensures resp.Body.Close() runs unconditionally when Check returns.
-	defer resp.Body.Close()
+	defer c.drainAndClose(getResp.Body)
 
-	// Drain a small portion of the body (up to 4KB) before closing.
-	// In HTTP/1.1 and HTTP/2, draining the response body allows Go's http.Transport
-	// to reuse the underlying TCP socket in its idle connection pool (Keep-Alive),
-	// avoiding the overhead of repeated 3-way TCP handshakes and TLS negotiations.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	res.StatusCode = getResp.StatusCode
+	res.Error = nil
 
-	res.StatusCode = resp.StatusCode
-
-	// HTTP status codes in the 4xx (client error) and 5xx (server error) ranges
-	// signify broken links. 2xx (Success) and 3xx (Redirects handled by client) are alive.
-	if resp.StatusCode >= 400 {
+	if getResp.StatusCode >= 400 {
 		res.Broken = true
+	} else {
+		res.Broken = false
 	}
 
 	return res
+}
+
+// doRequest constructs and executes an HTTP request with context and headers.
+func (c *LinkChecker) doRequest(ctx context.Context, method, targetURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	return c.client.Do(req)
+}
+
+// drainAndClose consumes up to 4KB of body to allow connection reuse, then closes the socket.
+func (c *LinkChecker) drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4096))
+	_ = body.Close()
+}
+
+// shouldFallbackToGET returns true if the status code suggests the server
+// does not support or rejects HEAD requests, but might accept GET.
+func shouldFallbackToGET(statusCode int) bool {
+	switch statusCode {
+	case http.StatusMethodNotAllowed, // 405
+		http.StatusNotImplemented,    // 501
+		http.StatusForbidden:         // 403 (many CDNs block HEAD)
+		return true
+	default:
+		return false
+	}
 }
