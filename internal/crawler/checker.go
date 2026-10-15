@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,8 +18,8 @@ const DefaultUserAgent = "deadlink/1.0 (+https://github.com/mnasies/deadlink)"
 
 // Sentinel errors for redirect handling.
 var (
-	ErrRedirectLoop      = errors.New("redirect loop detected")
-	ErrTooManyRedirects  = errors.New("too many redirects")
+	ErrRedirectLoop     = errors.New("redirect loop detected")
+	ErrTooManyRedirects = errors.New("too many redirects")
 )
 
 // Result represents the outcome of probing a single link.
@@ -39,9 +40,10 @@ type Result struct {
 type LinkChecker struct {
 	client         *http.Client
 	userAgent      string
-	maxRetries     int           // Max retry attempts for transient errors (default 2)
-	initialBackoff time.Duration // Base backoff delay (default 100ms)
-	maxRedirects   int           // Max redirect hops allowed (default 10)
+	maxRetries     int              // Max retry attempts for transient errors (default 2)
+	initialBackoff time.Duration    // Base backoff delay (default 100ms)
+	maxRedirects   int              // Max redirect hops allowed (default 10)
+	rateLimiter    *HostRateLimiter // Token bucket limiter partitioned per hostname
 }
 
 // NewLinkChecker constructs a LinkChecker with custom redirect policy and timeout.
@@ -64,13 +66,17 @@ func NewLinkChecker(client *http.Client, userAgent string) *LinkChecker {
 	}
 
 	// Install custom CheckRedirect policy if none is explicitly provided on the client.
-	// This enables early circular redirect loop detection and hop limit enforcement.
 	if client.CheckRedirect == nil {
 		client.CheckRedirect = checker.checkRedirectPolicy
 	}
 
 	checker.client = client
 	return checker
+}
+
+// SetRateLimiter configures per-host rate limiting on the checker.
+func (c *LinkChecker) SetRateLimiter(rl *HostRateLimiter) {
+	c.rateLimiter = rl
 }
 
 // SetRedirectLimit configures the maximum allowed redirect hops.
@@ -93,12 +99,10 @@ func (c *LinkChecker) SetRetryPolicy(maxRetries int, initialBackoff time.Duratio
 // checkRedirectPolicy is an http.Client.CheckRedirect function that tracks redirect
 // history, detects circular redirect loops early, and limits total hops.
 func (c *LinkChecker) checkRedirectPolicy(req *http.Request, via []*http.Request) error {
-	// 1. Enforce maximum redirect hops
 	if len(via) >= c.maxRedirects {
 		return ErrTooManyRedirects
 	}
 
-	// 2. Detect circular loops (e.g. /a -> /b -> /a)
 	incomingURL := req.URL.String()
 	for _, prev := range via {
 		if strings.EqualFold(prev.URL.String(), incomingURL) {
@@ -115,7 +119,6 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 	var lastResult Result
 
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		// Stop retrying if the parent context has been canceled
 		if ctx.Err() != nil {
 			lastResult.Error = ctx.Err()
 			lastResult.Broken = true
@@ -129,27 +132,22 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 		res.Duration = time.Since(start)
 		lastResult = res
 
-		// If healthy (2xx or 3xx), return immediately
 		if !res.Broken {
 			return res
 		}
 
-		// Permanent errors or fatal redirect loops must NOT be retried
 		if !isTransient(res.StatusCode, res.Error) {
 			return res
 		}
 
-		// If we've reached our maximum allowed retries, return the final failure
 		if attempt == c.maxRetries {
 			return res
 		}
 
-		// Exponential backoff delay
 		delay := c.initialBackoff * (1 << attempt)
 
 		select {
 		case <-time.After(delay):
-			// Proceed to next retry attempt
 		case <-ctx.Done():
 			lastResult.Error = ctx.Err()
 			lastResult.Broken = true
@@ -183,13 +181,11 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 			return res
 		}
 
-		// Only fall back to GET if HEAD was specifically rejected by method
 		if !shouldFallbackToGET(resp.StatusCode) {
 			res.Broken = true
 			return res
 		}
 	} else if isRedirectError(err) {
-		// Redirect loops or max redirects abort immediately with clean unwrapped errors
 		res.Error = unwrapRedirectError(err)
 		res.Broken = true
 		res.MethodUsed = http.MethodHead
@@ -215,7 +211,6 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 	res.FinalURL = getResp.Request.URL.String()
 	res.RedirectCount = calculateRedirects(getResp.Request)
 
-	// Check for Retry-After header on 429 responses if available
 	if getResp.StatusCode == http.StatusTooManyRequests {
 		if retryAfter := getResp.Header.Get("Retry-After"); retryAfter != "" {
 			if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 {
@@ -236,8 +231,17 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 	return res
 }
 
-// doRequest constructs and executes an HTTP request with context and headers.
+// doRequest enforces per-host rate limiting, constructs the request, and executes it.
 func (c *LinkChecker) doRequest(ctx context.Context, method, targetURL string) (*http.Response, error) {
+	// Respect per-host token bucket before touching the network
+	if c.rateLimiter != nil {
+		if parsed, err := url.Parse(targetURL); err == nil && parsed.Hostname() != "" {
+			if err := c.rateLimiter.Wait(ctx, parsed.Hostname()); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, nil)
 	if err != nil {
 		return nil, err
@@ -255,9 +259,6 @@ func (c *LinkChecker) drainAndClose(body io.ReadCloser) {
 	_ = body.Close()
 }
 
-// calculateRedirects estimates the number of redirects taken by checking request context.
-// In Go net/http, resp.Request is the final request after following redirects.
-// If resp.Request.Response is present, each chained response indicates one redirect hop.
 func calculateRedirects(req *http.Request) int {
 	hops := 0
 	curr := req
@@ -268,13 +269,10 @@ func calculateRedirects(req *http.Request) int {
 	return hops
 }
 
-// isRedirectError tests whether err is caused by a redirect loop or exceeding redirect limits.
 func isRedirectError(err error) bool {
 	return errors.Is(err, ErrRedirectLoop) || errors.Is(err, ErrTooManyRedirects)
 }
 
-// unwrapRedirectError extracts the underlying ErrRedirectLoop or ErrTooManyRedirects
-// from Go's *url.Error wrapper.
 func unwrapRedirectError(err error) error {
 	if errors.Is(err, ErrRedirectLoop) {
 		return ErrRedirectLoop
@@ -285,23 +283,18 @@ func unwrapRedirectError(err error) error {
 	return err
 }
 
-// shouldFallbackToGET returns true if the status code suggests the server
-// does not support or rejects HEAD requests, but might accept GET.
 func shouldFallbackToGET(statusCode int) bool {
 	switch statusCode {
-	case http.StatusMethodNotAllowed, // 405
-		http.StatusNotImplemented,    // 501
-		http.StatusForbidden:         // 403
+	case http.StatusMethodNotAllowed,
+		http.StatusNotImplemented,
+		http.StatusForbidden:
 		return true
 	default:
 		return false
 	}
 }
 
-// isTransient determines whether a failure is transient (warranting a retry)
-// or permanent (such as 404 Not Found, which should never be retried).
 func isTransient(statusCode int, err error) bool {
-	// Redirect errors are permanent structural failures
 	if isRedirectError(err) {
 		return false
 	}

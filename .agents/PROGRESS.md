@@ -640,3 +640,69 @@ However, misconfigured server routing rules frequently cause two severe issues:
 - **Methods Added**:
   - `(c *LinkChecker) SetRedirectLimit(maxRedirects int)`: Configures maximum allowed redirect hops.
   - `(c *LinkChecker) checkRedirectPolicy(req *http.Request, via []*http.Request) error`: Internal hook for hop counting and loop detection.
+
+---
+
+### Chunk 2.4: Per-Host Rate Limiting (`golang.org/x/time/rate`)
+**File**: [`internal/crawler/ratelimit.go`](../internal/crawler/ratelimit.go)  
+**Tests**: [`internal/crawler/test/ratelimit_test.go`](../internal/crawler/test/ratelimit_test.go)
+
+#### 1. What was built & Why
+A concurrent web crawler with 10-50 worker threads can easily issue hundreds of HTTP requests per second to a single target server. This triggers anti-scraping countermeasures:
+- Web Application Firewalls (Cloudflare, AWS WAF) ban the crawler's IP address.
+- Small servers exhaust database connection pools or return `429 Too Many Requests`.
+- Ethical crawling ("politeness") requires pacing requests to any given host.
+- **Architectural Solution (Partitioned Per-Host Token Bucket)**:
+  - If we used a single global rate limiter, crawling slow third-party external links would artificially throttle internal page discovery on the target domain.
+  - We implemented `HostRateLimiter`: an automated registry that lazily allocates an independent `rate.Limiter` token bucket for every unique hostname encountered (`example.com`, `github.com`, `cdn.net`).
+  - Configured via `Config.RateLimit` (requests per second per host, default 10 req/s).
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### The Token Bucket Algorithm (`golang.org/x/time/rate`)
+- The Token Bucket algorithm works as follows:
+  - Tokens are added to the bucket at a constant rate `r` (tokens per second).
+  - The bucket has a maximum capacity `b` (burst capacity).
+  - Each network request must consume 1 token before touching the socket.
+  - If the bucket is empty, `limiter.Wait(ctx)` sleeps until a token is replenished, or unblocks immediately if `ctx` is canceled.
+
+##### Fine-Grained Locking: Never Sleep While Holding a Mutex
+- In concurrent systems programming, holding a lock while performing I/O or sleeping causes catastrophic lock contention.
+- In `HostRateLimiter.Wait(ctx, host)`:
+  ```go
+  h.mu.Lock()
+  limiter, exists := h.limiters[cleanHost]
+  if !exists {
+      limiter = rate.NewLimiter(h.rps, h.burst)
+      h.limiters[cleanHost] = limiter
+  }
+  h.mu.Unlock() // Release mutex BEFORE sleeping!
+
+  return limiter.Wait(ctx) // Thread-safe sleep happens outside the registry lock
+  ```
+- The mutex is held for mere nanoseconds strictly to perform the map lookup or insert.
+- `rate.Limiter` internally maintains its own fine-grained atomic state, allowing concurrent workers targeting different hostnames to proceed in parallel without contention.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `rate.NewLimiter(rps, burst)` | Token bucket algorithm / Leaky bucket | `governor::RateLimiter` / `ratelimit_meter` |
+| `HostRateLimiter` | `std::unordered_map<std::string, std::shared_ptr<TokenBucket>>` protected by `std::mutex` | `DashMap<String, Arc<RateLimiter>>` |
+| `limiter.Wait(ctx)` | `condition_variable::wait_for` checking token count | `limiter.until_ready().await` |
+
+---
+
+#### 4. API Inventory (Created in Chunk 2.4)
+
+- **Structs**:
+  - `HostRateLimiter`: Thread-safe registry of per-hostname token buckets.
+- **Functions & Methods**:
+  - `NewHostRateLimiter(rps float64, burst int) *HostRateLimiter`: Constructor with configurable rate and burst.
+  - `(h *HostRateLimiter) Wait(ctx context.Context, host string) error`: Blocks until host token bucket allows request or context expires.
+  - `(c *LinkChecker) SetRateLimiter(rl *HostRateLimiter)`: Injects rate limiter into link checker.
+  - `Config.RateLimit float64`: Config field specifying requests per second per host.

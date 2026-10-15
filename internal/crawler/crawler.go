@@ -16,6 +16,7 @@ type Config struct {
 	MaxDepth    int           // Maximum link recursion depth (0 = start page only)
 	Timeout     time.Duration // Network timeout per probe
 	UserAgent   string        // HTTP User-Agent header
+	RateLimit   float64       // Max requests per second per host (0 = unlimited)
 }
 
 // DefaultConfig provides conservative defaults for crawling.
@@ -25,6 +26,7 @@ func DefaultConfig() Config {
 		MaxDepth:    3,
 		Timeout:     10 * time.Second,
 		UserAgent:   DefaultUserAgent,
+		RateLimit:   10.0,
 	}
 }
 
@@ -66,6 +68,10 @@ func NewCrawler(cfg Config, checker *LinkChecker) *Crawler {
 	if checker == nil {
 		checker = NewLinkChecker(nil, cfg.UserAgent)
 	}
+	if cfg.RateLimit > 0 && checker.rateLimiter == nil {
+		checker.SetRateLimiter(NewHostRateLimiter(cfg.RateLimit, 1))
+	}
+
 	return &Crawler{
 		config:  cfg,
 		checker: checker,
@@ -73,8 +79,6 @@ func NewCrawler(cfg Config, checker *LinkChecker) *Crawler {
 }
 
 // Crawl performs a recursive crawl starting at rawStartURL.
-// onResult is an optional callback invoked as each link is checked (useful for live CLI output or SSE).
-// Returns summary statistics and a slice of all checked link results.
 func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(Result)) (*CrawlStats, []Result, error) {
 	start := time.Now()
 
@@ -88,21 +92,11 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 		return nil, nil, err
 	}
 
-	// jobs channel: Unbuffered channel for passing work from coordinator to workers.
-	// Ownership: coordinator sends jobs, workers receive jobs, coordinator closes jobs on shutdown.
 	jobs := make(chan Job)
-
-	// results channel: Buffered channel for workers to report task outcomes back to coordinator.
-	// Buffer size equals worker concurrency so workers never block reporting a completed task.
-	// Ownership: workers send results, coordinator receives results, coordinator drains on exit.
 	results := make(chan taskResult, c.config.Concurrency)
 
-	// sync.WaitGroup: Synchronizes the lifecycle of the worker pool goroutines.
-	// Ensures all worker goroutines have fully exited before Crawl returns, preventing goroutine leaks.
 	var wg sync.WaitGroup
 
-	// WORKER POOL: Spawn exactly c.config.Concurrency worker goroutines.
-	// Why: Bounded concurrency ensures we do not spawn thousands of goroutines or exhaust OS sockets.
 	for i := 0; i < c.config.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
@@ -111,9 +105,6 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 		}()
 	}
 
-	// COORDINATOR STATE:
-	// All crawler state (queue, visited set, metrics) is owned EXCLUSIVELY by this goroutine.
-	// Because no other goroutine reads or writes these structures, zero mutexes are needed!
 	visited := make(map[string]struct{})
 	queue := []Job{
 		{URL: canonicalStart, ParentURL: "", Depth: 0},
@@ -124,17 +115,10 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 	brokenCount := 0
 	inFlight := 0
 
-	// COORDINATOR EVENT LOOP:
-	// Dispatches queued jobs to workers when workers are ready, processes results,
-	// and terminates cleanly when all in-flight work and queued jobs are exhausted.
 	for {
 		var currentJob Job
 		var sendJobs chan Job
 
-		// SELECT WITH DYNAMIC NIL CHANNEL:
-		// In Go, sending to or receiving from a nil channel blocks forever.
-		// When queue is empty, setting sendJobs = nil disables the send case in the select statement,
-		// allowing the coordinator to wait exclusively for incoming results or context cancellation.
 		if len(queue) > 0 {
 			currentJob = queue[0]
 			sendJobs = jobs
@@ -144,7 +128,6 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 
 		select {
 		case <-ctx.Done():
-			// Context canceled or timed out: abort immediately.
 			close(jobs)
 			wg.Wait()
 			return &CrawlStats{
@@ -154,7 +137,6 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 			}, allResults, ctx.Err()
 
 		case sendJobs <- currentJob:
-			// Dispatched one job to an available worker
 			queue = queue[1:]
 			inFlight++
 
@@ -170,7 +152,6 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 				onResult(tr.result)
 			}
 
-			// Schedule newly discovered links for crawling if within recursion depth limit
 			if tr.depth < c.config.MaxDepth {
 				for _, link := range tr.discoveredLinks {
 					if _, alreadyVisited := visited[link]; !alreadyVisited {
@@ -184,11 +165,9 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 				}
 			}
 
-			// TERMINATION CONDITION:
-			// When inFlight == 0 AND queue is empty, the entire crawl tree is exhausted.
 			if inFlight == 0 && len(queue) == 0 {
-				close(jobs) // Signals all workers to finish their loops and exit
-				wg.Wait()   // Wait for all workers to return
+				close(jobs)
+				wg.Wait()
 
 				return &CrawlStats{
 					TotalChecked: len(allResults),
@@ -203,20 +182,16 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 // worker processes jobs received from the jobs channel until jobs is closed.
 func (c *Crawler) worker(ctx context.Context, baseURL *url.URL, jobs <-chan Job, results chan<- taskResult) {
 	for job := range jobs {
-		// Respect context cancellation while waiting or between jobs
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Step 1: Probe the link for status code and reachability
 		probeCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 		res := c.checker.Check(probeCtx, job.URL, job.ParentURL)
 		cancel()
 
 		var discovered []string
 
-		// Step 2: If the link is internal, reachable (2xx), and within depth limit:
-		// fetch the HTML page and extract hyperlinks for recursive traversal.
 		targetParsed, err := url.Parse(job.URL)
 		isInternal := err == nil && IsInternal(baseURL, targetParsed)
 
@@ -224,7 +199,6 @@ func (c *Crawler) worker(ctx context.Context, baseURL *url.URL, jobs <-chan Job,
 			discovered = c.fetchAndExtract(ctx, job.URL)
 		}
 
-		// Step 3: Send result and newly discovered links back to coordinator
 		select {
 		case results <- taskResult{
 			result:          res,
@@ -242,19 +216,13 @@ func (c *Crawler) fetchAndExtract(ctx context.Context, pageURL string) []string 
 	reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, pageURL, nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("User-Agent", c.config.UserAgent)
-
-	resp, err := c.checker.client.Do(req)
+	// doRequest on LinkChecker respects rate limiting
+	resp, err := c.checker.doRequest(reqCtx, http.MethodGet, pageURL)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
 
-	// Only parse HTML responses (skip binary files like PDFs, ZIPs, or images)
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(strings.ToLower(contentType), "text/html") && contentType != "" {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
