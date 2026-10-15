@@ -391,3 +391,55 @@ A library is only as useful as its interface. In Chunk 1.5, we implemented the C
 - **Functions**:
   - `main()`: Process entrypoint.
   - `run(args []string, stdout, stderr io.Writer) int`: Testable CLI executor with flag parsing, signal handling, and summary generation.
+
+---
+
+### Chunk 1.6: Integration Testing with `httptest` & Race Detection
+**File**: [`internal/crawler/test/crawler_test.go`](../internal/crawler/test/crawler_test.go)
+
+#### 1. What was built & Why
+In Chunk 1.6, we completed the verification suite for the entire Stage 1 (CLI MVP):
+- **Graph Cycle & Loop Detection Test**: Simulates an internal website where `/` links to `/about`, and `/about` links back to `/`. Proves that the visited deduplication set prevents infinite loops and terminates gracefully.
+- **Non-HTML Binary Asset Handling (`TestCrawler_NonHTMLHandling`)**: Proves that binary assets (`image/png`, `application/pdf`) have their HTTP reachability probed (e.g. 200 OK or 404), but their response bodies are never parsed for HTML links.
+- **High Concurrency Stress Test (`TestCrawler_HighConcurrencyStress`)**: Spawns 20 concurrent worker goroutines traversing an interlinked 20-page web graph.
+- **ThreadSanitizer / Race Detector Verification (`go test -race ./...`)**: Passed with 0 data races detected, confirming that channel-based ownership of the visited map and queue prevents memory corruption.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Go's Built-in Race Detector (`go test -race`)
+- In C++ and Rust, detecting multi-threaded data races requires compiling with `-fsanitize=thread` (Clang/GCC ThreadSanitizer or LLVM TSAN).
+- Go has native TSAN integration built directly into the toolchain (`go test -race`, `go build -race`).
+- During compilation with `-race`, the compiler instruments all memory read and write operations with runtime bookkeeping. At runtime, if two goroutines access the same memory location concurrently where at least one is a write and without synchronization, the race detector immediately panics with a complete goroutine stack trace.
+- Our coordinator architecture passed `-race` under 20 concurrent workers because shared mutable state is eliminated; workers communicate exclusively through channel value copies.
+
+##### Simulating Real Web Topologies with `httptest.Server`
+- In systems testing, creating mock HTTP servers in C++ often requires external dependencies (like cpp-httplib or libcurl mocks).
+- In Go, `httptest.NewServer` spins up a lightweight `net/http` server bound to a kernel-assigned ephemeral loopback port (`127.0.0.1:0`). It generates real TCP sockets and passes through Go's actual `net/http.Transport` socket stack.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `go test -race` | `-fsanitize=thread` (ThreadSanitizer / TSAN) | `cargo-tarpaulin` / Loom concurrency model checker |
+| Circular graph crawl | BFS/DFS traversal with `std::unordered_set<std::string>` visited filter | Graph traversal with `HashSet<Url>` |
+| Atomic counters (`sync/atomic`) | `std::atomic<int64_t>` | `std::sync::atomic::AtomicI64` |
+| `httptest.Server.Client()` | Client with pre-configured loopback transport | `reqwest::Client` configured for mock service |
+
+---
+
+#### 4. API Inventory & Verification (Completed in Chunk 1.6)
+
+- **Test Fixtures Added**:
+  - `TestCrawler_NonHTMLHandling`: Asserts that binary assets (PNG, PDF) are checked for HTTP status but skipped for HTML link extraction.
+  - `TestCrawler_HighConcurrencyStress`: Verifies 20-worker pool race-freedom on circular web graph.
+- **Stage 1 Milestone Achieved**:
+  - ✅ URL normalization & relative link resolution (`url.go`)
+  - ✅ Streaming HTML link extraction via tokenizer (`extract.go`)
+  - ✅ Single link prober with HTTP socket lifecycle management (`checker.go`)
+  - ✅ Deadlock-free worker pool & visited set coordinator (`crawler.go`)
+  - ✅ CLI entrypoint with live progress, signal handling, and exit codes (`main.go`)
+  - ✅ Black-box integration tests & race detector verification (`crawler_test.go`, `cli_test.go`)

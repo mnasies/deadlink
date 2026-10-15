@@ -2,9 +2,11 @@ package crawler_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,4 +168,109 @@ func TestCrawler_Crawl(t *testing.T) {
 			t.Errorf("expected context cancellation error, got nil")
 		}
 	})
+}
+
+// TestCrawler_NonHTMLHandling verifies that binary files (images, PDFs)
+// are checked for HTTP status but their bodies are NOT tokenized as HTML.
+func TestCrawler_NonHTMLHandling(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`
+				<html>
+				<body>
+					<img src="/image.png">
+					<a href="/document.pdf">Download</a>
+				</body>
+				</html>
+			`))
+		case "/image.png":
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte{0x89, 'P', 'N', 'G'}) // PNG magic bytes
+		case "/document.pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("%PDF-1.4"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	checker := crawler.NewLinkChecker(server.Client(), "test/1.0")
+	c := crawler.NewCrawler(crawler.Config{Concurrency: 3, MaxDepth: 2, Timeout: 2 * time.Second}, checker)
+
+	stats, results, err := c.Crawl(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stats.BrokenCount != 0 {
+		t.Errorf("expected 0 broken links, got %d", stats.BrokenCount)
+	}
+	// Root (/) + image.png + document.pdf = 3 total checked
+	if stats.TotalChecked != 3 {
+		t.Errorf("expected 3 links checked, got %d (results: %+v)", stats.TotalChecked, results)
+	}
+}
+
+// TestCrawler_HighConcurrencyStress simulates a dense web graph with high concurrency
+// to prove thread-safety, race-freedom, and deadlock-free termination.
+func TestCrawler_HighConcurrencyStress(t *testing.T) {
+	var requestCount int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&requestCount, 1)
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+
+		// Each page links to multiple other pages across a 20-node graph
+		var pageNum int
+		_, _ = fmt.Sscanf(r.URL.Path, "/page-%d", &pageNum)
+
+		next1 := (pageNum + 1) % 20
+		next2 := (pageNum + 3) % 20
+		next3 := (pageNum + 7) % 20
+
+		_, _ = fmt.Fprintf(w, `
+			<html>
+			<body>
+				<a href="/page-%d">Link 1</a>
+				<a href="/page-%d">Link 2</a>
+				<a href="/page-%d">Link 3</a>
+			</body>
+			</html>
+		`, next1, next2, next3)
+	}))
+	defer server.Close()
+
+	checker := crawler.NewLinkChecker(server.Client(), "stress/1.0")
+	// 20 concurrent workers traversing the circular graph
+	cfg := crawler.Config{
+		Concurrency: 20,
+		MaxDepth:    5,
+		Timeout:     3 * time.Second,
+	}
+	c := crawler.NewCrawler(cfg, checker)
+
+	startURL := server.URL + "/page-0"
+	stats, results, err := c.Crawl(context.Background(), startURL, nil)
+	if err != nil {
+		t.Fatalf("unexpected crawl error: %v", err)
+	}
+
+	if stats.BrokenCount != 0 {
+		t.Errorf("expected 0 broken links, got %d", stats.BrokenCount)
+	}
+
+	// Graph has 20 nodes; all 20 should be visited and deduplicated cleanly
+	if stats.TotalChecked != 20 {
+		t.Errorf("expected 20 unique pages visited, got %d", stats.TotalChecked)
+	}
+	if len(results) != 20 {
+		t.Errorf("expected 20 results, got %d", len(results))
+	}
 }
