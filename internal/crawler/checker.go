@@ -2,8 +2,12 @@ package crawler
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -19,12 +23,15 @@ type Result struct {
 	Error      error         `json:"error,omitempty"`
 	Broken     bool          `json:"broken"`
 	MethodUsed string        `json:"method_used,omitempty"` // "HEAD" or "GET" (fallback)
+	Attempts   int           `json:"attempts"`              // Number of probe attempts made (1 + retries)
 }
 
 // LinkChecker encapsulates the HTTP client and configuration for probing links.
 type LinkChecker struct {
-	client    *http.Client
-	userAgent string
+	client         *http.Client
+	userAgent      string
+	maxRetries     int           // Max retry attempts for transient errors (default 2)
+	initialBackoff time.Duration // Base backoff delay (default 100ms)
 }
 
 // NewLinkChecker constructs a LinkChecker. If client is nil, a sane default is provided.
@@ -38,59 +45,109 @@ func NewLinkChecker(client *http.Client, userAgent string) *LinkChecker {
 		userAgent = DefaultUserAgent
 	}
 	return &LinkChecker{
-		client:    client,
-		userAgent: userAgent,
+		client:         client,
+		userAgent:      userAgent,
+		maxRetries:     2,
+		initialBackoff: 100 * time.Millisecond,
+	}
+}
+
+// SetRetryPolicy customizes the retry behavior for transient errors.
+func (c *LinkChecker) SetRetryPolicy(maxRetries int, initialBackoff time.Duration) {
+	if maxRetries >= 0 {
+		c.maxRetries = maxRetries
+	}
+	if initialBackoff > 0 {
+		c.initialBackoff = initialBackoff
 	}
 }
 
 // Check probes targetURL with an HTTP request and returns a Result.
-// It uses a HEAD-first strategy: sends a cheap HEAD request, and if the target
-// server rejects it (405 Method Not Allowed, 501 Not Implemented) or returns 403,
-// it automatically falls back to a GET request before declaring the link dead.
+// It combines a HEAD-first strategy with automatic GET fallback and exponential
+// backoff retries for transient failures (429, 502, 503, 504, connection resets).
 func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result {
 	start := time.Now()
+	var lastResult Result
+
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		// Stop retrying if the parent context has been canceled
+		if ctx.Err() != nil {
+			lastResult.Error = ctx.Err()
+			lastResult.Broken = true
+			lastResult.Attempts = attempt + 1
+			lastResult.Duration = time.Since(start)
+			return lastResult
+		}
+
+		res := c.probeOnce(ctx, targetURL, parentURL)
+		res.Attempts = attempt + 1
+		res.Duration = time.Since(start)
+		lastResult = res
+
+		// If healthy (2xx or 3xx), return immediately
+		if !res.Broken {
+			return res
+		}
+
+		// Permanent errors (like 404 Not Found, 410 Gone, 400 Bad Request) must NOT be retried
+		if !isTransient(res.StatusCode, res.Error) {
+			return res
+		}
+
+		// If we've reached our maximum allowed retries, return the final failure
+		if attempt == c.maxRetries {
+			return res
+		}
+
+		// Calculate backoff delay with exponential scaling: initial * 2^attempt
+		delay := c.initialBackoff * (1 << attempt)
+
+		// Context-aware sleep: unblocks immediately if ctx is canceled during backoff
+		select {
+		case <-time.After(delay):
+			// Proceed to next retry attempt
+		case <-ctx.Done():
+			lastResult.Error = ctx.Err()
+			lastResult.Broken = true
+			lastResult.Duration = time.Since(start)
+			return lastResult
+		}
+	}
+
+	return lastResult
+}
+
+// probeOnce performs a single HEAD-first probe with GET fallback if rejected.
+func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string) Result {
 	res := Result{
 		URL:       targetURL,
 		ParentURL: parentURL,
 	}
 
-	// Step 1: Issue cheap HEAD request (header probe, no body transfer)
+	// 1. Issue HEAD request
 	resp, err := c.doRequest(ctx, http.MethodHead, targetURL)
 	if err == nil {
 		res.StatusCode = resp.StatusCode
 		res.MethodUsed = http.MethodHead
-
-		// Clean up socket descriptor and drain
 		c.drainAndClose(resp.Body)
 
-		// If HEAD succeeded with a 2xx or 3xx status, link is healthy!
 		if resp.StatusCode < 400 {
-			res.Duration = time.Since(start)
 			res.Broken = false
 			return res
 		}
 
-		// If the server rejected HEAD specifically with:
-		// - 405 Method Not Allowed
-		// - 501 Not Implemented
-		// - 403 Forbidden (some WAFs/CDNs block HEAD but allow GET)
-		// we must not declare it dead yet: retry with GET!
+		// Only fall back to GET if HEAD was specifically rejected by method
 		if !shouldFallbackToGET(resp.StatusCode) {
-			// Definite failure like 404 Not Found, 410 Gone, or 500 Server Error
-			res.Duration = time.Since(start)
 			res.Broken = true
 			return res
 		}
 	}
 
-	// Step 2: Fallback to GET
-	// Reached if HEAD returned 405/501/403 OR if HEAD encountered a network transport error
+	// 2. Fall back to GET
 	getResp, getErr := c.doRequest(ctx, http.MethodGet, targetURL)
-	res.Duration = time.Since(start)
 	res.MethodUsed = http.MethodGet
 
 	if getErr != nil {
-		// Both HEAD and GET failed
 		if err != nil {
 			res.Error = err
 		} else {
@@ -100,16 +157,24 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 		return res
 	}
 
+	// Check for Retry-After header on 429 responses if available
+	if getResp.StatusCode == http.StatusTooManyRequests {
+		if retryAfter := getResp.Header.Get("Retry-After"); retryAfter != "" {
+			if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 {
+				// Cap maximum header sleep to 5s to avoid holding workers forever
+				if seconds > 5 {
+					seconds = 5
+				}
+				c.initialBackoff = time.Duration(seconds) * time.Second
+			}
+		}
+	}
+
 	defer c.drainAndClose(getResp.Body)
 
 	res.StatusCode = getResp.StatusCode
 	res.Error = nil
-
-	if getResp.StatusCode >= 400 {
-		res.Broken = true
-	} else {
-		res.Broken = false
-	}
+	res.Broken = getResp.StatusCode >= 400
 
 	return res
 }
@@ -144,4 +209,32 @@ func shouldFallbackToGET(statusCode int) bool {
 	default:
 		return false
 	}
+}
+
+// isTransient determines whether a failure is transient (warranting a retry)
+// or permanent (such as 404 Not Found, which should never be retried).
+func isTransient(statusCode int, err error) bool {
+	// Transient HTTP status codes
+	switch statusCode {
+	case http.StatusTooManyRequests,     // 429 Rate limited
+		http.StatusBadGateway,          // 502 Upstream glitch
+		http.StatusServiceUnavailable,  // 503 Overloaded
+		http.StatusGatewayTimeout:       // 504 Timeout
+		return true
+	}
+
+	// Network-level transient socket errors
+	if err != nil {
+		// Connection resets (ECONNRESET) or broken pipes
+		if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return true
+		}
+		// Go net.Error with Timeout() or Temporary()
+		var netErr net.Error
+		if errors.As(err, &netErr) && (netErr.Timeout()) {
+			return true
+		}
+	}
+
+	return false
 }

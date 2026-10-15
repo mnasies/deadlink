@@ -509,3 +509,71 @@ However, in production, real-world servers and CDNs are notoriously non-complian
   - `(c *LinkChecker) doRequest(ctx, method, targetURL) (*http.Response, error)`: Helper for executing context-aware HTTP requests.
   - `(c *LinkChecker) drainAndClose(body io.ReadCloser)`: Consumes up to 4KB of response body and safely closes socket file descriptor.
   - `shouldFallbackToGET(statusCode int) bool`: Predicate determining whether status code warrants GET retry.
+
+---
+
+### Chunk 2.2: Context Timeouts & Retries with Exponential Backoff
+**File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go)  
+**Tests**: [`internal/crawler/test/checker_test.go`](../internal/crawler/test/checker_test.go)
+
+#### 1. What was built & Why
+On the live web, network connections are noisy. A slow link or a temporary hiccup does not mean a page is permanently broken.
+However, naively retrying every failure causes massive delays: retrying a `404 Not Found` 3 times is completely futile and wastes crawl time.
+- **Selective Transient Error Classification (`isTransient`)**:
+  - **Do NOT Retry (Permanent)**: `404 Not Found`, `410 Gone`, `400 Bad Request`, `401 Unauthorized`. These return immediately on attempt 1.
+  - **DO Retry (Transient)**:
+    - `429 Too Many Requests`: Server rate-limiting (inspects `Retry-After` header if provided).
+    - `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`: Transient server overload / reverse-proxy restarts.
+    - Low-level socket errors: `ECONNRESET` (connection reset by peer), `EPIPE` (broken pipe), `io.ErrUnexpectedEOF`, and `net.Error.Timeout()`.
+- **Exponential Backoff**:
+  - `delay = initialBackoff * (1 << attempt)` (e.g. 100ms, 200ms, 400ms).
+- **Context-Aware Sleep**:
+  - Sleep is implemented via `select { case <-time.After(delay): case <-ctx.Done(): }`. If a user cancels the crawl (`Ctrl+C`) or crawl timeout fires during a backoff sleep, the worker unblocks instantly without hanging.
+- **Telemetry**:
+  - Added `Attempts` field to `Result` indicating how many attempts were made.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Unwrapping Socket Errors via `errors.Is` & `errors.As`
+- In C++, low-level network errors set `errno` (e.g. `ECONNRESET`, `EPIPE`).
+- In Go, socket errors returned by `net/http` are nested inside layers of wrapper structs (e.g. `*url.Error` wrapping `*net.OpError` wrapping `*os.SyscallError` wrapping `syscall.Errno`).
+- Go provides two standard inspection primitives:
+  - `errors.Is(err, target)`: Traverses the error unwrapping chain to test for equality against a specific sentinel error (e.g. `syscall.ECONNRESET` or `io.ErrUnexpectedEOF`).
+  - `errors.As(err, &target)`: Traverses the error chain to test if any error in the chain matches a specific interface or struct type (e.g. `var netErr net.Error; errors.As(err, &netErr)`).
+
+##### Context-Aware Sleeping vs Blocking Sleep
+- `time.Sleep(delay)` in Go (like `std::this_thread::sleep_for` in C++) is completely uninterruptible. If a worker is sleeping for 2 seconds and the user hits `Ctrl+C`, the thread remains blocked.
+- Idiomatic Go pattern:
+  ```go
+  select {
+  case <-time.After(delay):
+      // Timer fired, proceed
+  case <-ctx.Done():
+      // Context canceled, abort sleep immediately!
+      return
+  }
+  ```
+  `time.After(delay)` returns a channel `<-chan Time` that delivers a tick after `delay`. Go's `select` multiplexes between the timer channel and `ctx.Done()`, ensuring zero shutdown latency.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| Exponential backoff retry | Polly / custom C++ retry loop | `tokio_retry` / `backoff` crate |
+| `select { case <-time.After: case <-ctx.Done(): }` | `epoll_wait` with timerfd + eventfd | `tokio::select! { _ = sleep => {}, _ = cancel => {} }` |
+| `errors.Is(err, syscall.ECONNRESET)` | Inspecting `errno == ECONNRESET` | `err.kind() == std::io::ErrorKind::ConnectionReset` |
+| `errors.As(err, &netErr)` | `dynamic_cast<NetException*>(&e)` | Trait downcasting / `err.downcast_ref::<T>()` |
+
+---
+
+#### 4. API Inventory (Updated in Chunk 2.2)
+
+- **Struct Updates**:
+  - `Result.Attempts int`: Total number of probe attempts executed (1 + retries).
+- **Methods Added**:
+  - `(c *LinkChecker) SetRetryPolicy(maxRetries int, initialBackoff time.Duration)`: Configures retry bounds.
+  - `isTransient(statusCode int, err error) bool`: Categorizes whether a failure is retryable.
