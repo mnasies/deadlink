@@ -227,3 +227,94 @@ Once URLs are extracted, the crawler needs a dedicated component to probe them o
   - Test files in `internal/crawler/test/` declare `package crawler_test` and import `"github.com/mnasies/deadlink/internal/crawler"`.
   - This enforces **pure black-box testing**: tests can only interact with exported functions and types (`crawler.NormalizeURL`, `crawler.ExtractLinks`, `crawler.NewLinkChecker`), preventing accidental coupling to unexported internal implementation details.
   - Running `go test ./...` recursively tests all packages in the project tree.
+
+---
+
+### Chunk 1.4: Concurrent Worker Pool & Visited Deduplication Set
+**File**: [`internal/crawler/crawler.go`](../internal/crawler/crawler.go)  
+**Tests**: [`internal/crawler/test/crawler_test.go`](../internal/crawler/test/crawler_test.go)
+
+#### 1. What was built & Why
+A naive recursive crawler easily suffers from two catastrophic concurrency failure modes:
+1. **Unbounded Goroutines**: Spawning a goroutine for every discovered URL leads to thousands of concurrent network connections, exhausting file descriptors (`EMFILE`) and triggering socket resets.
+2. **Channel Deadlocks**: In a naive worker pool where workers push newly discovered child links back into the same channel they consume from, if the channel buffer fills up, all workers block attempting to push, leaving zero workers free to pull work.
+- **Architectural Solution (Coordinator-Worker Pattern)**:
+  - We implemented a bounded worker pool (`Config.Concurrency`, default 10 workers) managed by a central **Coordinator Loop**.
+  - **Workers** only receive single jobs from `jobs chan Job` and report completed task results via `results chan taskResult`.
+  - The **Coordinator** exclusively owns the pending queue slice (`[]Job`), the visited set (`map[string]struct{}`), and an `inFlight` job counter.
+  - **Zero Mutex Contention**: Because the `visited` map and `queue` are only accessed by the coordinator goroutine, **no mutexes are needed**. Concurrency is coordinated purely through message passing ("Do not communicate by sharing memory; instead, share memory by communicating").
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Disabling `select` Branches via `nil` Channels
+- In Go, sending to or receiving from an uninitialized / `nil` channel blocks forever:
+  ```go
+  var ch chan int // ch is nil
+  ch <- 1         // blocks forever!
+  ```
+- This behavior is an intentional language feature leveraged in `select` multiplexing.
+- In our coordinator:
+  ```go
+  var sendJobs chan Job
+  if len(queue) > 0 {
+      currentJob = queue[0]
+      sendJobs = jobs // Active channel: select will try to send to an available worker
+  } else {
+      sendJobs = nil  // Nil channel: select completely disables this branch!
+  }
+
+  select {
+  case sendJobs <- currentJob:
+      queue = queue[1:]
+      inFlight++
+  case tr := <-results:
+      inFlight--
+      ...
+  }
+  ```
+  When the queue is empty, `sendJobs` becomes `nil`, causing `select` to ignore the send branch without busy-waiting. The coordinator sits idle waiting exclusively on incoming results from workers or context cancellation.
+
+##### The `inFlight` Counter & Clean Termination
+- A recursive crawler cannot terminate simply because its queue is empty; workers may currently be processing pages that will yield 20 new links.
+- The coordinator tracks `inFlight`:
+  - When a job is sent to a worker: `inFlight++`
+  - When a worker returns a result: `inFlight--`
+- **Termination Invariant**: The crawl is complete if and only if:
+  `inFlight == 0 && len(queue) == 0`
+- Once satisfied, the coordinator closes `jobs` (signaling workers to exit) and waits for `wg.Wait()`.
+
+##### `sync.WaitGroup` Lifecycle & Preventing Goroutine Leaks
+- `sync.WaitGroup` acts like a thread barrier or atomic counter:
+  - `wg.Add(1)` before spawning each worker.
+  - `defer wg.Done()` inside each worker.
+  - `wg.Wait()` blocks until the counter reaches 0.
+- This guarantees zero orphaned goroutines remain running after `Crawl(...)` returns.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| Coordinator-Worker model | Actor pattern / single-threaded event loop + thread pool | Actix / Tokio actor loop with worker tasks |
+| `jobs := make(chan Job)` | Synchronized bounded queue (lock + condvar) | `tokio::sync::mpsc::channel(N)` |
+| `select` with `nil` channel | `epoll_ctl(EPOLL_CTL_DEL)` to stop listening for writable events | Modifying interest set in `mio` / custom `poll()` |
+| `sync.WaitGroup` | `std::latch` / `std::barrier` (C++20) | `tokio::task::JoinSet` / `crossbeam::scope` |
+| `defer wg.Done()` | Custom RAII decrement guard | Scope guard / `Drop` implementation |
+
+---
+
+#### 4. API Inventory (Created in Chunk 1.4)
+
+- **Structs**:
+  - `Config`: Crawl configuration (`Concurrency`, `MaxDepth`, `Timeout`, `UserAgent`).
+  - `CrawlStats`: Aggregate crawl metrics (`TotalChecked`, `BrokenCount`, `Duration`).
+  - `Job`: Individual work item (`URL`, `ParentURL`, `Depth`).
+  - `taskResult`: Worker-to-coordinator internal payload (`Result`, `discoveredLinks`, `depth`).
+  - `Crawler`: Engine struct holding configuration and link checker.
+- **Functions & Methods**:
+  - `DefaultConfig() Config`: Conservative default crawler settings.
+  - `NewCrawler(cfg Config, checker *LinkChecker) *Crawler`: Factory constructor.
+  - `(c *Crawler) Crawl(ctx context.Context, startURL string, onResult func(Result)) (*CrawlStats, []Result, error)`: Executes full recursive crawl with bounded concurrency, deduplication, and streaming result callbacks.
