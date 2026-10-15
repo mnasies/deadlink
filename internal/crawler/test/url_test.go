@@ -1,14 +1,14 @@
-package crawler
+package crawler_test
 
 import (
 	"errors"
 	"net/url"
 	"testing"
+
+	"github.com/mnasies/deadlink/internal/crawler"
 )
 
 func TestNormalizeURL(t *testing.T) {
-	// Table-driven tests: standard Go idiom for testing multiple inputs/outputs
-	// against the same function. Similar to parameterized tests in C++ GTest.
 	tests := []struct {
 		name        string
 		input       string
@@ -50,32 +50,31 @@ func TestNormalizeURL(t *testing.T) {
 			name:        "empty url error",
 			input:       "   ",
 			expectError: true,
-			targetErr:   ErrEmptyURL,
+			targetErr:   crawler.ErrEmptyURL,
 		},
 		{
 			name:        "reject unsupported scheme mailto",
 			input:       "mailto:admin@example.com",
 			expectError: true,
-			targetErr:   ErrUnsupportedScheme,
+			targetErr:   crawler.ErrUnsupportedScheme,
 		},
 		{
 			name:        "reject unsupported scheme javascript",
 			input:       "javascript:void(0)",
 			expectError: true,
-			targetErr:   ErrUnsupportedScheme,
+			targetErr:   crawler.ErrUnsupportedScheme,
 		},
 		{
 			name:        "reject relative url directly into NormalizeURL",
 			input:       "/just/a/path",
 			expectError: true,
-			targetErr:   ErrUnsupportedScheme,
+			targetErr:   crawler.ErrUnsupportedScheme,
 		},
 	}
 
 	for _, tt := range tests {
-		// t.Run runs each test case as a named subtest
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := NormalizeURL(tt.input)
+			got, err := crawler.NormalizeURL(tt.input)
 			if tt.expectError {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -97,7 +96,7 @@ func TestNormalizeURL(t *testing.T) {
 }
 
 func TestResolveURL(t *testing.T) {
-	baseURL, err := url.Parse("https://example.com/blog/posts/index.html")
+	baseURL, err := url.Parse("https://example.com/blog/posts/hello.html")
 	if err != nil {
 		t.Fatalf("failed to parse base URL: %v", err)
 	}
@@ -138,25 +137,25 @@ func TestResolveURL(t *testing.T) {
 			name:        "ignore mailto link",
 			ref:         "mailto:user@domain.com",
 			expectError: true,
-			targetErr:   ErrUnsupportedScheme,
+			targetErr:   crawler.ErrUnsupportedScheme,
 		},
 		{
 			name:        "ignore javascript link",
 			ref:         "javascript:alert(1)",
 			expectError: true,
-			targetErr:   ErrUnsupportedScheme,
+			targetErr:   crawler.ErrUnsupportedScheme,
 		},
 		{
 			name:        "empty reference",
 			ref:         "",
 			expectError: true,
-			targetErr:   ErrEmptyURL,
+			targetErr:   crawler.ErrEmptyURL,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ResolveURL(baseURL, tt.ref)
+			got, err := crawler.ResolveURL(baseURL, tt.ref)
 			if tt.expectError {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -187,8 +186,8 @@ func TestIsInternal(t *testing.T) {
 		{"https://example.com/blog", true},
 		{"http://example.com/contact", true},
 		{"https://EXAMPLE.COM/about", true},
-		{"https://example.com:8080/api", true}, // same hostname, port stripped
-		{"https://sub.example.com/docs", false}, // subdomain is distinct host
+		{"https://example.com:8080/api", true},
+		{"https://sub.example.com/docs", false},
 		{"https://google.com", false},
 	}
 
@@ -198,7 +197,7 @@ func TestIsInternal(t *testing.T) {
 			t.Fatalf("failed to parse target URL %q: %v", tt.target, err)
 		}
 
-		got := IsInternal(base, targetURL)
+		got := crawler.IsInternal(base, targetURL)
 		if got != tt.expected {
 			t.Errorf("IsInternal(%q, %q) = %v, want %v", base.String(), tt.target, got, tt.expected)
 		}

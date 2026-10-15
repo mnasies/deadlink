@@ -6,7 +6,7 @@
 
 ### Chunk 1.1: URL Normalization & Link Utilities
 **File**: [`internal/crawler/url.go`](../internal/crawler/url.go)  
-**Tests**: [`internal/crawler/url_test.go`](../internal/crawler/url_test.go)
+**Tests**: [`internal/crawler/test/url_test.go`](../internal/crawler/test/url_test.go)
 
 #### 1. What was built & Why
 In web crawling, deduplication is paramount. If you visit `https://example.com/about#team`, `https://example.com/about`, and `HTTP://EXAMPLE.COM/about/`, a naive crawler would hit the network 3 separate times and risk infinite loops.
@@ -75,7 +75,7 @@ In web crawling, deduplication is paramount. If you visit `https://example.com/a
 
 ### Chunk 1.2: HTML Link Extractor
 **File**: [`internal/crawler/extract.go`](../internal/crawler/extract.go)  
-**Tests**: [`internal/crawler/extract_test.go`](../internal/crawler/extract_test.go)
+**Tests**: [`internal/crawler/test/extract_test.go`](../internal/crawler/test/extract_test.go)
 
 #### 1. What was built & Why
 A web page contains links inside hyperlinks (`<a href="...">`), external stylesheets (`<link href="...">`), scripts (`<script src="...">`), and embedded assets (`<img src="...">`).
@@ -145,7 +145,7 @@ A web page contains links inside hyperlinks (`<a href="...">`), external stylesh
 
 ### Chunk 1.3: Single Link Prober
 **File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go)  
-**Tests**: [`internal/crawler/checker_test.go`](../internal/crawler/checker_test.go)
+**Tests**: [`internal/crawler/test/checker_test.go`](../internal/crawler/test/checker_test.go)
 
 #### 1. What was built & Why
 Once URLs are extracted, the crawler needs a dedicated component to probe them over HTTP, measure network latency, detect broken statuses (4xx, 5xx), and capture network-level failures (DNS resolution errors, connection refused, TLS handshake errors, context timeouts).
@@ -217,3 +217,13 @@ Once URLs are extracted, the crawler needs a dedicated component to probe them o
 - **Functions & Methods**:
   - `NewLinkChecker(client *http.Client, userAgent string) *LinkChecker`: Constructor with fallback defaults.
   - `(c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result`: Probes a single URL with context timeout support and socket cleanup.
+
+---
+
+### Architecture Refinement: Dedicated Test Subdirectory (`internal/crawler/test/`)
+- Tests have been relocated to [`internal/crawler/test/`](../internal/crawler/test/).
+- **Go Concept (Black-Box / External Testing)**:
+  - In Go, a directory defines a package. Subdirectories are separate packages.
+  - Test files in `internal/crawler/test/` declare `package crawler_test` and import `"github.com/mnasies/deadlink/internal/crawler"`.
+  - This enforces **pure black-box testing**: tests can only interact with exported functions and types (`crawler.NormalizeURL`, `crawler.ExtractLinks`, `crawler.NewLinkChecker`), preventing accidental coupling to unexported internal implementation details.
+  - Running `go test ./...` recursively tests all packages in the project tree.

@@ -1,9 +1,11 @@
-package crawler
+package crawler_test
 
 import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/mnasies/deadlink/internal/crawler"
 )
 
 func TestExtractLinks(t *testing.T) {
@@ -33,14 +35,13 @@ func TestExtractLinks(t *testing.T) {
 			<a href="https://external.org/info">External Reference</a>
 		</main>
 		<footer>
-			<!-- Duplicate link to verify in-page deduplication -->
 			<a href="/about">About Us Again</a>
 		</footer>
 	</body>
 	</html>
 	`
 
-	links, err := ExtractLinks(baseURL, strings.NewReader(htmlContent))
+	links, err := crawler.ExtractLinks(baseURL, strings.NewReader(htmlContent))
 	if err != nil {
 		t.Fatalf("unexpected error from ExtractLinks: %v", err)
 	}
@@ -69,23 +70,22 @@ func TestExtractLinks_EdgeCases(t *testing.T) {
 	baseURL, _ := url.Parse("https://example.com")
 
 	t.Run("nil base url", func(t *testing.T) {
-		_, err := ExtractLinks(nil, strings.NewReader("<html></html>"))
+		_, err := crawler.ExtractLinks(nil, strings.NewReader("<html></html>"))
 		if err == nil {
 			t.Errorf("expected error with nil baseURL, got nil")
 		}
 	})
 
 	t.Run("nil reader", func(t *testing.T) {
-		_, err := ExtractLinks(baseURL, nil)
+		_, err := crawler.ExtractLinks(baseURL, nil)
 		if err == nil {
 			t.Errorf("expected error with nil reader, got nil")
 		}
 	})
 
 	t.Run("malformed html recovery", func(t *testing.T) {
-		// Improperly nested tags and unclosed tags shouldn't crash the tokenizer
 		malformed := `<p>Unclosed paragraph<a href="/first">Link 1<div>Improper nest<a href="/second">Link 2</a>`
-		links, err := ExtractLinks(baseURL, strings.NewReader(malformed))
+		links, err := crawler.ExtractLinks(baseURL, strings.NewReader(malformed))
 		if err != nil {
 			t.Fatalf("ExtractLinks should handle malformed HTML gracefully: %v", err)
 		}

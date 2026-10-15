@@ -1,4 +1,4 @@
-package crawler
+package crawler_test
 
 import (
 	"context"
@@ -7,13 +7,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mnasies/deadlink/internal/crawler"
 )
 
 func TestLinkChecker_Check(t *testing.T) {
-	// httptest.NewServer starts a real, local HTTP server listening on a random loopback port.
-	// It is the standard Go way to test HTTP clients without mocking network sockets.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify custom User-Agent
 		if !strings.Contains(r.Header.Get("User-Agent"), "deadlink") {
 			http.Error(w, "missing user agent", http.StatusBadRequest)
 			return
@@ -28,7 +27,6 @@ func TestLinkChecker_Check(t *testing.T) {
 		case "/server-error":
 			w.WriteHeader(http.StatusInternalServerError)
 		case "/slow":
-			// Sleep longer than the client's timeout to test deadline handling
 			time.Sleep(100 * time.Millisecond)
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -37,7 +35,7 @@ func TestLinkChecker_Check(t *testing.T) {
 	}))
 	defer server.Close()
 
-	checker := NewLinkChecker(server.Client(), "deadlink-test/1.0")
+	checker := crawler.NewLinkChecker(server.Client(), "deadlink-test/1.0")
 
 	tests := []struct {
 		name           string
@@ -79,7 +77,7 @@ func TestLinkChecker_Check(t *testing.T) {
 			name:           "timeout canceled context",
 			path:           "/slow",
 			parentURL:      "https://example.com/slow-page",
-			timeout:        20 * time.Millisecond, // times out before 100ms sleep
+			timeout:        20 * time.Millisecond,
 			expectedStatus: 0,
 			expectBroken:   true,
 			expectErr:      true,
