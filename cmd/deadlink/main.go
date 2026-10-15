@@ -21,8 +21,6 @@ const (
 )
 
 func main() {
-	// main() is a thin wrapper around run() so that tests can execute CLI logic
-	// with mock arguments and captured stdout/stderr without terminating the process via os.Exit.
 	code := run(os.Args[1:], os.Stdout, os.Stderr)
 	os.Exit(code)
 }
@@ -30,15 +28,14 @@ func main() {
 // run parses CLI flags, configures the crawler, listens for OS signals (Ctrl+C),
 // streams results to stdout, and returns an exit code.
 func run(args []string, stdout, stderr io.Writer) int {
-	// flag.FlagSet: An isolated flag parser.
-	// We use flag.NewFlagSet instead of package-level flag.Parse() so that we can pass
-	// custom arguments in tests and redirect error output.
 	flags := flag.NewFlagSet("deadlink", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
 	concurrency := flags.Int("concurrency", 10, "number of concurrent worker goroutines")
 	maxDepth := flags.Int("max-depth", 3, "maximum link recursion depth for internal pages")
 	timeout := flags.Duration("timeout", 10*time.Second, "network timeout per link probe")
+	rateLimit := flags.Float64("rate-limit", 10.0, "maximum requests per second per host (0 = unlimited)")
+	ignoreRobots := flags.Bool("ignore-robots", false, "bypass robots.txt restrictions")
 
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: deadlink [options] <url>\n\n")
@@ -58,28 +55,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	rawTargetURL := flags.Arg(0)
 
-	// OS SIGNAL HANDLING:
-	// signal.NotifyContext registers a channel with the Go runtime to capture SIGINT (Ctrl+C)
-	// and SIGTERM. When a signal is caught, ctx.Done() closes automatically, triggering
-	// graceful cancellation inside the crawler without abruptly killing the process.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cfg := crawler.Config{
-		Concurrency: *concurrency,
-		MaxDepth:    *maxDepth,
-		Timeout:     *timeout,
-		UserAgent:   crawler.DefaultUserAgent,
+		Concurrency:     *concurrency,
+		MaxDepth:        *maxDepth,
+		Timeout:         *timeout,
+		UserAgent:       crawler.DefaultUserAgent,
+		RateLimit:       *rateLimit,
+		IgnoreRobotsTxt: *ignoreRobots,
 	}
 
 	engine := crawler.NewCrawler(cfg, nil)
 
-	fmt.Fprintf(stdout, "Crawling %s (concurrency=%d, max-depth=%d, timeout=%s)...\n\n",
-		rawTargetURL, cfg.Concurrency, cfg.MaxDepth, cfg.Timeout)
+	fmt.Fprintf(stdout, "Crawling %s (concurrency=%d, max-depth=%d, rate-limit=%.1f/s, timeout=%s)...\n\n",
+		rawTargetURL, cfg.Concurrency, cfg.MaxDepth, cfg.RateLimit, cfg.Timeout)
 
 	var brokenLinks []crawler.Result
 
-	// Stream results live to stdout as workers report them
 	onResult := func(res crawler.Result) {
 		if res.Broken {
 			brokenLinks = append(brokenLinks, res)
@@ -92,7 +86,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, "       found on: %s\n", res.ParentURL)
 			}
 		} else {
-			fmt.Fprintf(stdout, "[ OK ] %d  - %s\n", res.StatusCode, res.URL)
+			methodTag := ""
+			if res.MethodUsed == "GET" {
+				methodTag = " (GET fallback)"
+			}
+			fmt.Fprintf(stdout, "[ OK ] %d  - %s%s\n", res.StatusCode, res.URL, methodTag)
 		}
 	}
 

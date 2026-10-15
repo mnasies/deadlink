@@ -706,3 +706,76 @@ A concurrent web crawler with 10-50 worker threads can easily issue hundreds of 
   - `(h *HostRateLimiter) Wait(ctx context.Context, host string) error`: Blocks until host token bucket allows request or context expires.
   - `(c *LinkChecker) SetRateLimiter(rl *HostRateLimiter)`: Injects rate limiter into link checker.
   - `Config.RateLimit float64`: Config field specifying requests per second per host.
+
+---
+
+### Chunk 2.5: robots.txt Compliance (RFC 9309)
+**File**: [`internal/crawler/robots.go`](../internal/crawler/robots.go)  
+**Tests**: [`internal/crawler/test/robots_test.go`](../internal/crawler/test/robots_test.go)
+
+#### 1. What was built & Why
+A polite, production-grade crawler must respect the Robots Exclusion Protocol (RFC 9309). Sites host `/robots.txt` to tell automated crawlers which parts of their directory tree must not be traversed (e.g. `/admin/`, `/private/`, search filters, user accounts).
+- **Robots Parser (`ParseRobots`)**:
+  - Parses `User-agent`, `Disallow`, `Allow`, and `Crawl-delay` directives.
+  - **Precedence**: Specific matching `User-agent: deadlink` blocks take priority over general `User-agent: *` wildcard blocks.
+  - **Pattern Matching**: Implements RFC 9309 rule matching including wildcards (`*`) and end-of-path anchors (`$`). If multiple rules match a path, the most specific (longest) pattern wins. If an `Allow` and `Disallow` rule have identical lengths, `Allow` takes precedence.
+- **Dynamic Crawl-Delay Adaptation**:
+  - If `/robots.txt` specifies `Crawl-delay: 2`, the crawler dynamically adjusts its per-host rate limiter to 0.5 req/sec (1 request every 2 seconds).
+- **Graceful Network Degradation (`FetchRobots`)**:
+  - If `/robots.txt` returns `404 Not Found`, missing, or network fails, the standard dictates all paths are permitted.
+- **Bypass Flag**:
+  - Users can explicitly bypass robots.txt restrictions via `--ignore-robots` / `Config.IgnoreRobotsTxt`.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Parsing Line Streams via `bufio.Scanner`
+- In C++, tokenizing text lines involves `std::getline(file, line)`. In Rust, `BufRead::lines()`.
+- In Go, `bufio.NewScanner(reader)` provides a memory-efficient line iterator:
+  ```go
+  scanner := bufio.NewScanner(reader)
+  for scanner.Scan() {
+      line := scanner.Text()
+      ...
+  }
+  ```
+- It reuses an internal buffer, avoiding allocating new string objects until `.Text()` is called.
+
+##### Regex Pattern Compilation & Fallback
+- Go's `regexp` package uses the RE2 engine (guaranteed linear time `O(n)` matching, completely immune to catastrophic backtracking / Regular Expression Denial of Service ReDoS).
+- We translate robots patterns (`/path/*.pdf$`) into strict RE2 regular expressions (`^/path/.*\.pdf$`).
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `bufio.Scanner` | `std::getline(stream, line)` | `std::io::BufRead::lines()` |
+| RE2 linear regex (`regexp`) | Google RE2 C++ library | `regex` crate in Rust (also linear-time RE2) |
+| Precedence / specificity sort | Sorting rules by `pattern.length()` descending | Sorting by pattern length with `Ord` |
+
+---
+
+#### 4. API Inventory & Stage 2 Milestone Achieved
+
+- **Structs**:
+  - `RobotsRule`: Compiled regex pattern with allow/disallow flag and pattern length.
+  - `RobotsData`: Parsed directive set with `IsAllowed(path)` and `CrawlDelay`.
+- **Functions & Methods**:
+  - `ParseRobots(reader io.Reader, userAgent string) *RobotsData`: Parses robots.txt stream.
+  - `FetchRobots(client *http.Client, baseURL *url.URL, userAgent string) *RobotsData`: Downloads and parses `/robots.txt` over HTTP.
+  - `(r *RobotsData) IsAllowed(rawPath string) bool`: Tests path against rules.
+  - `(r *RobotsData) IsPathAllowed(targetURL *url.URL) bool`: Normalizes URL path and tests against rules.
+  - `(h *HostRateLimiter) SetRate(rps float64)`: Dynamically adjusts rate limit.
+  - `Config.IgnoreRobotsTxt bool`: Flag to bypass robots compliance.
+
+---
+
+### 🎉 Stage 2 Milestone Summary (Robustness Complete)
+- ✅ **Chunk 2.1**: HEAD request probe with automatic GET fallback on 405/501/403.
+- ✅ **Chunk 2.2**: Context timeouts and retries with exponential backoff for transient 429/502/503/504/socket resets.
+- ✅ **Chunk 2.3**: Custom `CheckRedirect` policy with early circular loop detection and hop limit enforcement.
+- ✅ **Chunk 2.4**: Per-host token bucket rate limiting (`golang.org/x/time/rate`).
+- ✅ **Chunk 2.5**: Full RFC 9309 robots.txt compliance and dynamic crawl-delay adaptation.

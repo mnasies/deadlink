@@ -12,21 +12,23 @@ import (
 
 // Config holds user-configurable options for the crawler.
 type Config struct {
-	Concurrency int           // Bounded number of worker goroutines
-	MaxDepth    int           // Maximum link recursion depth (0 = start page only)
-	Timeout     time.Duration // Network timeout per probe
-	UserAgent   string        // HTTP User-Agent header
-	RateLimit   float64       // Max requests per second per host (0 = unlimited)
+	Concurrency     int           // Bounded number of worker goroutines
+	MaxDepth        int           // Maximum link recursion depth (0 = start page only)
+	Timeout         time.Duration // Network timeout per probe
+	UserAgent       string        // HTTP User-Agent header
+	RateLimit       float64       // Max requests per second per host (0 = unlimited)
+	IgnoreRobotsTxt bool          // Whether to bypass robots.txt compliance (default false: respect robots.txt)
 }
 
 // DefaultConfig provides conservative defaults for crawling.
 func DefaultConfig() Config {
 	return Config{
-		Concurrency: 10,
-		MaxDepth:    3,
-		Timeout:     10 * time.Second,
-		UserAgent:   DefaultUserAgent,
-		RateLimit:   10.0,
+		Concurrency:     10,
+		MaxDepth:        3,
+		Timeout:         10 * time.Second,
+		UserAgent:       DefaultUserAgent,
+		RateLimit:       10.0,
+		IgnoreRobotsTxt: false,
 	}
 }
 
@@ -92,6 +94,19 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 		return nil, nil, err
 	}
 
+	// Step 1: Fetch and parse robots.txt unless explicitly disabled
+	var robots *RobotsData
+	if !c.config.IgnoreRobotsTxt {
+		robots = FetchRobots(c.checker.client, baseURL, c.config.UserAgent)
+		// If robots.txt specifies a Crawl-delay, adjust rate limiter accordingly
+		if robots != nil && robots.CrawlDelay > 0 && c.checker.rateLimiter != nil {
+			delaySec := robots.CrawlDelay.Seconds()
+			if delaySec > 0 {
+				c.checker.rateLimiter.SetRate(1.0 / delaySec)
+			}
+		}
+	}
+
 	jobs := make(chan Job)
 	results := make(chan taskResult, c.config.Concurrency)
 
@@ -152,8 +167,19 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 				onResult(tr.result)
 			}
 
+			// Schedule newly discovered links for crawling if within recursion depth limit
 			if tr.depth < c.config.MaxDepth {
 				for _, link := range tr.discoveredLinks {
+					linkParsed, parseErr := url.Parse(link)
+					if parseErr != nil {
+						continue
+					}
+
+					// Respect robots.txt: skip queuing disallowed internal pages
+					if robots != nil && IsInternal(baseURL, linkParsed) && !robots.IsPathAllowed(linkParsed) {
+						continue
+					}
+
 					if _, alreadyVisited := visited[link]; !alreadyVisited {
 						visited[link] = struct{}{}
 						queue = append(queue, Job{
@@ -216,7 +242,6 @@ func (c *Crawler) fetchAndExtract(ctx context.Context, pageURL string) []string 
 	reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 	defer cancel()
 
-	// doRequest on LinkChecker respects rate limiting
 	resp, err := c.checker.doRequest(reqCtx, http.MethodGet, pageURL)
 	if err != nil {
 		return nil

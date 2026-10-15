@@ -9,8 +9,6 @@ import (
 )
 
 // HostRateLimiter manages token-bucket rate limiters partitioned per hostname.
-// This ensures that requests to one domain do not bottleneck requests to another,
-// while preventing any single host from being hammered by concurrent workers.
 type HostRateLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
@@ -31,6 +29,19 @@ func NewHostRateLimiter(rps float64, burst int) *HostRateLimiter {
 	}
 }
 
+// SetRate updates the rate limit dynamically (e.g. from robots.txt crawl-delay).
+func (h *HostRateLimiter) SetRate(rps float64) {
+	if h == nil || rps <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rps = rate.Limit(rps)
+	for _, l := range h.limiters {
+		l.SetLimit(h.rps)
+	}
+}
+
 // Wait blocks until the token-bucket for the given host permits a request,
 // or until the provided context is canceled.
 func (h *HostRateLimiter) Wait(ctx context.Context, host string) error {
@@ -39,12 +50,10 @@ func (h *HostRateLimiter) Wait(ctx context.Context, host string) error {
 	}
 
 	cleanHost := strings.ToLower(strings.TrimSpace(host))
-	// Strip port numbers (e.g., "example.com:8080" -> "example.com")
 	if colon := strings.IndexByte(cleanHost, ':'); colon != -1 {
 		cleanHost = cleanHost[:colon]
 	}
 
-	// Double-check / get-or-create limiter under lock
 	h.mu.Lock()
 	limiter, exists := h.limiters[cleanHost]
 	if !exists {
@@ -53,7 +62,5 @@ func (h *HostRateLimiter) Wait(ctx context.Context, host string) error {
 	}
 	h.mu.Unlock()
 
-	// Wait outside the lock so other goroutines targeting different hosts can proceed immediately.
-	// rate.Limiter is internally thread-safe and respects context cancellation.
 	return limiter.Wait(ctx)
 }
