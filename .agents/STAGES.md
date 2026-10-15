@@ -1,106 +1,93 @@
-# Implementation Stages Roadmap
+# Implementation Stages Roadmap (Micro-Chunked)
 
-Development is split into 6 focused, iterative stages.
-After each stage, stop for user review and provide an explanation of the concurrency and networking concepts implemented.
+Each stage is divided into small, digestible chunks.
+In our passive learning sessions, each chunk is built, explained with low-level systems & Go concepts, and reviewed before moving to the next.
 
 ---
 
 ## Stage 1: CLI MVP
 **Goal**: Crawl one domain, check links concurrently, and print broken ones.
 
-### What it does
-- Takes a starting URL via command-line argument.
-- Downloads the initial page and parses HTML using `golang.org/x/net/html`.
-- Extracts all `href` and `src` links, normalizes them, and distinguishes internal vs external links.
-- Uses a worker pool pattern with goroutines and channels to concurrently probe links.
-- Keeps a thread-safe `visited` set to avoid visiting URLs multiple times or getting caught in loops.
-- Differentiates broken links (HTTP 4xx, 5xx, DNS errors, connection refused) from working links (HTTP 2xx, 3xx).
-- Prints broken links found (URL, status/error, source page).
-
-### Concurrency & Networking Focus
-- Goroutines as lightweight concurrent execution units.
-- Channels as synchronization and work distribution primitives.
-- Bounded concurrency with worker pools (`sync.WaitGroup`).
-- Mutexes vs concurrent maps for the visited set.
+- **Chunk 1.1: URL Normalization & Link Utilities** (`internal/crawler/url.go`)
+  - Parse, strip fragments (`#hash`), handle trailing slashes, scheme validation (`http`/`https`).
+  - Resolve relative paths against base URL.
+  - Classify internal vs external URLs based on hostname.
+- **Chunk 1.2: HTML Link Extractor** (`internal/crawler/extract.go`)
+  - Stream HTML via `golang.org/x/net/html` tokenizer (avoiding expensive DOM trees).
+  - Extract all `href` and `src` attributes.
+- **Chunk 1.3: Single Link Prober** (`internal/crawler/checker.go`)
+  - Issue HTTP request, record status code or network errors into a `Result` struct.
+  - Basic error classification (broken vs alive).
+- **Chunk 1.4: Worker Pool & Visited Deduplication Set** (`internal/crawler/crawler.go`)
+  - Thread-safe visited set with `sync.RWMutex`.
+  - Worker pool using goroutines and channels (`chan Job`, `chan Result`).
+  - In-flight counter to coordinate recursive internal traversal and clean termination.
+- **Chunk 1.5: CLI Entrypoint & Terminal Summary** (`cmd/deadlink/main.go`)
+  - Flag parsing (`--concurrency`, `--timeout`, `--max-depth`).
+  - Clean streaming terminal output and broken links summary table.
+  - Exit code `0` (clean) vs `1` (broken links found).
+- **Chunk 1.6: Integration Testing with `httptest`** (`internal/crawler/crawler_test.go`)
+  - Local mock server with internal pages, broken links (404), external links, and loop protection.
 
 ---
 
 ## Stage 2: Robustness
 **Goal**: Handle real-world network quirks and server idiosyncrasies gracefully.
 
-### What it does
-- **HEAD -> GET Fallback**: Some servers reject `HEAD` requests (e.g. 405 Method Not Allowed, 501 Not Implemented, or dropping connections). Fall back to a lightweight `GET` request (reading only the headers).
-- **Timeouts & Retries**: Add per-request timeouts with `context.WithTimeout` and retries with exponential backoff for transient network errors (e.g., 429 Too Many Requests, 503 Service Unavailable, connection resets).
-- **Redirects & Loops**: Custom `http.Client.CheckRedirect` policy to detect infinite redirect loops and limit maximum redirect hops (e.g., max 10).
-- **Per-Host Rate Limiting**: Implement token bucket rate limiters per hostname using `golang.org/x/time/rate` to avoid slamming third-party servers.
-- **robots.txt**: Fetch and parse `/robots.txt` before crawling internal pages; respect disallow directives and crawl-delay.
-
-### Concurrency & Networking Focus
-- Context propagation and cancellation.
-- HTTP semantics (idempotency, HEAD vs GET, transfer encoding).
-- Token bucket algorithm for rate limiting.
+- **Chunk 2.1: HEAD -> GET Fallback**
+  - Probing with HEAD; automatically falling back to GET on 405/501 or unexpected drops.
+- **Chunk 2.2: Context Timeouts & Retries with Backoff**
+  - `context.WithTimeout` per request, exponential backoff for transient errors (429, 503, connection resets).
+- **Chunk 2.3: Redirect Control & Loop Detection**
+  - Custom `http.Client.CheckRedirect` policy to detect infinite redirect loops and enforce hop limit.
+- **Chunk 2.4: Per-Host Rate Limiting**
+  - Token-bucket rate limiter (`golang.org/x/time/rate`) per domain to avoid slamming target servers.
+- **Chunk 2.5: robots.txt Compliance**
+  - Fetch and parse `/robots.txt` before crawling internal paths; respect disallow rules and crawl-delay.
 
 ---
 
 ## Stage 3: Output & Automation
 **Goal**: Rich reporting formats and CI/CD readiness.
 
-### What it does
-- Implement `/internal/report` with dual output formatters:
-  - **JSON output** (`--format=json`): structured machine-readable format for automation and scripts.
-  - **Markdown output** (`--format=markdown`): human-readable tables suitable for posting to PR comments or issue summaries.
-  - **Terminal / Plain text**: default clean streaming output with summary statistics (checked, alive, broken, skipped).
-- Strict exit code semantics:
-  - Exit code `0`: Crawl completed and no broken links were found.
-  - Exit code `1`: One or more broken links were found.
-  - Exit code `2`: Fatal configuration or initial connectivity error.
+- **Chunk 3.1: Report Data Model & Interface** (`internal/report`)
+- **Chunk 3.2: JSON Formatter** (`--format=json` for automation and scripts)
+- **Chunk 3.3: Markdown Formatter** (`--format=markdown` for PR comments and summaries)
+- **Chunk 3.4: CLI Formatting Flags & Strict Exit Codes** (`0` = clean, `1` = broken, `2` = fatal error)
 
 ---
 
 ## Stage 4: Safety & SSRF Guard
 **Goal**: Robust defense against Server-Side Request Forgery and resource exhaustion.
 
-### What it does
-- Implement `/internal/safety` package.
-- **SSRF Guard**:
-  - DNS resolution before connection.
-  - IP filtering: reject loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, `fe80::/10`), IPv4-mapped IPv6, broadcast, and cloud metadata IPs (`169.254.169.254`).
-  - Pin dialer to the validated IP to defeat DNS rebinding attacks.
-  - Re-validate target IP on every redirect hop.
-- **Crawl Limits**:
-  - Hard caps on `maxPages`, `maxLinks`, `maxDepth`, and `maxResponseSize` (`io.LimitReader`).
-  - Global crawl timeout.
-- **Unit & Integration Tests**:
-  - Comprehensive tests using `httptest.Server` simulating:
-    - 404 Not Found & 500 Internal Server Error
-    - Redirect loops
-    - Slow responses (timeout testing)
-    - Private IP / SSRF targets
-    - Large payload / memory bomb attempts
+- **Chunk 4.1: IP Filtering & Forbidden CIDR Ranges** (`internal/safety`)
+  - Block loopback, RFC 1918 private IPs, link-local, cloud metadata (`169.254.169.254`).
+- **Chunk 4.2: Safe Custom Dialer & IP Pinning**
+  - Pre-connection DNS resolution, socket dialing pinned to validated IP (defeats DNS rebinding).
+- **Chunk 4.3: Redirect Hop SSRF Re-validation**
+  - Re-verify target IP on every HTTP redirect hop.
+- **Chunk 4.4: Resource Caps & Guards**
+  - Limit HTML response size (`io.LimitReader`), max pages, max depth, global crawl timeout.
+- **Chunk 4.5: SSRF & Safety Test Suite**
+  - `httptest` tests simulating private IP probes, slowloris timeouts, memory bombs.
 
 ---
 
 ## Stage 5: Web Server & Live SSE Streaming
 **Goal**: Provide a clean web dashboard with live crawl results.
 
-### What it does
-- Implement `/cmd/server` that serves a single embedded HTML dashboard (`go:embed`).
-- **Server-Sent Events (SSE)**:
-  - Client submits a URL.
-  - Server initiates crawler in a background goroutine and streams live events (`link-checked`, `broken-link`, `progress`, `completed`, `error`) over an `HTTP text/event-stream`.
-- **Web Safety**:
-  - Web-specific rate limiting per client IP.
-  - Global concurrent crawl limit (e.g., max 3 active crawls simultaneously) to avoid server exhaustion on free-tier hosting.
-  - Strict HTML escaping for all displayed URLs and error strings.
+- **Chunk 5.1: Embedded Single-Page UI** (`web/`, `go:embed`)
+- **Chunk 5.2: Server-Sent Events (SSE) Protocol Engine** (`cmd/server`)
+  - Streaming live link events and crawl stats over `text/event-stream`.
+- **Chunk 5.3: Web Protection & Concurrency Limits**
+  - Per-IP rate limiting and global active crawl semaphore.
+- **Chunk 5.4: Frontend SSE Integration & Strict HTML Escaping**
 
 ---
 
 ## Stage 6: Ship it (Docker, Render, CI/CD)
 **Goal**: Package, containerize, deploy, and automate distribution.
 
-### What it does
-- **Multi-stage Dockerfile**: builds a scratch or alpine minimal static binary with ca-certificates.
-- **Render Deployment**: configuration and instructions to host the web interface at `deadlink.mnasies.me`.
-- **GitHub Actions & GoReleaser**:
-  - Workflow to run `go test ./...` and `golangci-lint` on pull requests.
-  - GoReleaser configuration to compile static binaries for Linux, macOS (Intel/ARM), and Windows, publishing GitHub releases automatically on Git tags.
+- **Chunk 6.1: Multi-stage Static Dockerfile**
+- **Chunk 6.2: Render Deployment Blueprint** (`deadlink.mnasies.me`)
+- **Chunk 6.3: GitHub Actions & GoReleaser Pipeline**
