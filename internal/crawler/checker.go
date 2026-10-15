@@ -22,6 +22,17 @@ var (
 	ErrTooManyRedirects = errors.New("too many redirects")
 )
 
+// LinkStatus represents the classified health and reachability state of a link.
+type LinkStatus string
+
+const (
+	StatusOK      LinkStatus = "OK"      // 2xx/3xx: Accessible, alive, and healthy
+	StatusDead    LinkStatus = "DEAD"    // 404, 410, DNS NXDOMAIN, connection refused, redirect loop
+	StatusBlocked LinkStatus = "BLOCKED" // Access blocked by bot protection, WAF, or access controls (403, 429, 401, 451, Cloudflare challenge)
+	StatusTimeout LinkStatus = "TIMEOUT" // Network timeout, context deadline exceeded, or gateway timeout (504, 408)
+	StatusError   LinkStatus = "ERROR"   // Server-side errors (500, 502, 503) or socket resets/broken pipe
+)
+
 // Result represents the outcome of probing a single link.
 type Result struct {
 	URL           string        `json:"url"`
@@ -30,11 +41,27 @@ type Result struct {
 	StatusCode    int           `json:"status_code"`
 	Duration      time.Duration `json:"duration_ms"`
 	Error         error         `json:"error,omitempty"`
-	Broken        bool          `json:"broken"`
+	Status        LinkStatus    `json:"status"`                   // Granular classification (OK, DEAD, BLOCKED, TIMEOUT, ERROR)
+	Broken        bool          `json:"broken"`                   // Kept for backwards compatibility: true if Status == StatusDead || Status == StatusError
 	MethodUsed    string        `json:"method_used,omitempty"`    // "HEAD" or "GET" (fallback)
 	Attempts      int           `json:"attempts"`                 // Number of probe attempts made (1 + retries)
 	RedirectCount int           `json:"redirect_count,omitempty"` // Number of redirect hops followed
 }
+
+// IsOK returns true if the link is alive and responding normally.
+func (r Result) IsOK() bool { return r.Status == StatusOK }
+
+// IsDead returns true if the link is definitively broken or non-existent.
+func (r Result) IsDead() bool { return r.Status == StatusDead }
+
+// IsBlocked returns true if access was denied by bot protection, WAF, or authorization.
+func (r Result) IsBlocked() bool { return r.Status == StatusBlocked }
+
+// IsTimeout returns true if the probe failed due to network or gateway timeouts.
+func (r Result) IsTimeout() bool { return r.Status == StatusTimeout }
+
+// IsError returns true if the probe failed due to a server-side 5xx error or socket error.
+func (r Result) IsError() bool { return r.Status == StatusError }
 
 // LinkChecker encapsulates the HTTP client and configuration for probing links.
 type LinkChecker struct {
@@ -121,6 +148,7 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if ctx.Err() != nil {
 			lastResult.Error = ctx.Err()
+			lastResult.Status = ClassifyStatus(lastResult.StatusCode, ctx.Err(), nil)
 			lastResult.Broken = true
 			lastResult.Attempts = attempt + 1
 			lastResult.Duration = time.Since(start)
@@ -132,7 +160,7 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 		res.Duration = time.Since(start)
 		lastResult = res
 
-		if !res.Broken {
+		if res.Status == StatusOK {
 			return res
 		}
 
@@ -150,6 +178,7 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 		case <-time.After(delay):
 		case <-ctx.Done():
 			lastResult.Error = ctx.Err()
+			lastResult.Status = ClassifyStatus(lastResult.StatusCode, ctx.Err(), nil)
 			lastResult.Broken = true
 			lastResult.Duration = time.Since(start)
 			return lastResult
@@ -177,16 +206,19 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 		c.drainAndClose(resp.Body)
 
 		if resp.StatusCode < 400 {
+			res.Status = StatusOK
 			res.Broken = false
 			return res
 		}
 
 		if !shouldFallbackToGET(resp.StatusCode) {
-			res.Broken = true
+			res.Status = ClassifyStatus(resp.StatusCode, nil, resp.Header)
+			res.Broken = (res.Status == StatusDead || res.Status == StatusError)
 			return res
 		}
 	} else if isRedirectError(err) {
 		res.Error = unwrapRedirectError(err)
+		res.Status = StatusDead
 		res.Broken = true
 		res.MethodUsed = http.MethodHead
 		return res
@@ -204,7 +236,8 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 		} else {
 			res.Error = getErr
 		}
-		res.Broken = true
+		res.Status = ClassifyStatus(0, res.Error, nil)
+		res.Broken = (res.Status == StatusDead || res.Status == StatusError)
 		return res
 	}
 
@@ -226,7 +259,8 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 
 	res.StatusCode = getResp.StatusCode
 	res.Error = nil
-	res.Broken = getResp.StatusCode >= 400
+	res.Status = ClassifyStatus(getResp.StatusCode, nil, getResp.Header)
+	res.Broken = (res.Status == StatusDead || res.Status == StatusError)
 
 	return res
 }
@@ -318,4 +352,102 @@ func isTransient(statusCode int, err error) bool {
 	}
 
 	return false
+}
+
+// ClassifyStatus analyzes the HTTP status code, network error, and response headers
+// to categorize the link into one of: StatusOK, StatusDead, StatusBlocked, StatusTimeout, or StatusError.
+func ClassifyStatus(statusCode int, err error, header http.Header) LinkStatus {
+	if err != nil {
+		// 1. Timeout detection: context deadline exceeded or network timeout
+		if errors.Is(err, context.DeadlineExceeded) {
+			return StatusTimeout
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return StatusTimeout
+		}
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline exceeded") {
+			return StatusTimeout
+		}
+
+		// 2. Redirect anomalies (loops, exceeded hops) represent broken URL navigation
+		if isRedirectError(err) {
+			return StatusDead
+		}
+
+		// 3. DNS failure or connection refused indicates non-existent host or dead service
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return StatusDead
+		}
+		if errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "no such host") {
+			return StatusDead
+		}
+
+		// 4. Other network failures (socket reset, broken pipe, TLS failure)
+		return StatusError
+	}
+
+	// 2xx and 3xx are successful
+	if statusCode >= 200 && statusCode < 400 {
+		return StatusOK
+	}
+
+	// HTTP timeouts
+	if statusCode == http.StatusGatewayTimeout || statusCode == http.StatusRequestTimeout {
+		return StatusTimeout
+	}
+
+	// Bot protection / WAF / access controls
+	if statusCode == http.StatusForbidden ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusUnauthorized ||
+		statusCode == http.StatusUnavailableForLegalReasons {
+		return StatusBlocked
+	}
+
+	// Cloudflare / WAF 503 challenge
+	if statusCode == http.StatusServiceUnavailable && header != nil {
+		serverHeader := strings.ToLower(header.Get("Server"))
+		if strings.Contains(serverHeader, "cloudflare") ||
+			header.Get("cf-mitigated") == "challenge" ||
+			header.Get("cf-chl-bypass") != "" {
+			return StatusBlocked
+		}
+	}
+
+	// Permanent / definitive client-side broken states
+	if statusCode == http.StatusNotFound ||
+		statusCode == http.StatusGone ||
+		statusCode == http.StatusBadRequest ||
+		statusCode == http.StatusMethodNotAllowed ||
+		statusCode == http.StatusNotAcceptable ||
+		statusCode == http.StatusLengthRequired ||
+		statusCode == http.StatusPreconditionFailed ||
+		statusCode == http.StatusRequestURITooLong ||
+		statusCode == http.StatusUnsupportedMediaType ||
+		statusCode == http.StatusExpectationFailed ||
+		statusCode == http.StatusTeapot ||
+		statusCode == http.StatusMisdirectedRequest ||
+		statusCode == http.StatusUnprocessableEntity ||
+		statusCode == http.StatusLocked ||
+		statusCode == http.StatusFailedDependency ||
+		statusCode == http.StatusUpgradeRequired ||
+		statusCode == http.StatusPreconditionRequired ||
+		statusCode == http.StatusRequestHeaderFieldsTooLarge {
+		return StatusDead
+	}
+
+	// Server errors (500, 502, 503, etc.)
+	if statusCode >= 500 {
+		return StatusError
+	}
+
+	// Any other 4xx not explicitly classified
+	if statusCode >= 400 {
+		return StatusDead
+	}
+
+	return StatusOK
 }

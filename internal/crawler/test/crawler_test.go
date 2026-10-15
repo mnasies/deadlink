@@ -274,3 +274,79 @@ func TestCrawler_HighConcurrencyStress(t *testing.T) {
 		t.Errorf("expected 20 results, got %d", len(results))
 	}
 }
+
+// TestCrawler_MixedStatusClassification verifies that the crawler aggregates
+// OK, Dead, and Blocked links accurately without conflating bot protection with dead links.
+func TestCrawler_MixedStatusClassification(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`
+				<html>
+				<body>
+					<a href="/healthy">Healthy Child</a>
+					<a href="/bot-blocked">Bot Blocked Link</a>
+					<a href="/dead-link">Dead Link</a>
+				</body>
+				</html>
+			`))
+		case "/healthy":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html><body>OK</body></html>`))
+
+		case "/bot-blocked":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`403 Forbidden - Access Denied`))
+
+		case "/dead-link":
+			w.WriteHeader(http.StatusNotFound)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	checker := crawler.NewLinkChecker(server.Client(), "test/1.0")
+	c := crawler.NewCrawler(crawler.Config{Concurrency: 2, MaxDepth: 2, Timeout: 2 * time.Second}, checker)
+
+	stats, results, err := c.Crawl(context.Background(), server.URL, nil)
+	if err != nil {
+		t.Fatalf("unexpected crawl error: %v", err)
+	}
+
+	if stats.TotalChecked != 4 {
+		t.Errorf("expected 4 checked links (root, healthy, bot-blocked, dead-link), got %d", stats.TotalChecked)
+	}
+	if stats.OKCount != 2 {
+		t.Errorf("expected 2 OK links (root and healthy), got %d", stats.OKCount)
+	}
+	if stats.BlockedCount != 1 {
+		t.Errorf("expected 1 Blocked link (bot-blocked), got %d", stats.BlockedCount)
+	}
+	if stats.DeadCount != 1 {
+		t.Errorf("expected 1 Dead link (dead-link), got %d", stats.DeadCount)
+	}
+	if stats.BrokenCount != 1 {
+		t.Errorf("expected BrokenCount to equal DeadCount (1), got %d", stats.BrokenCount)
+	}
+
+	// Verify individual result statuses
+	statusMap := make(map[string]crawler.LinkStatus)
+	for _, res := range results {
+		statusMap[res.URL] = res.Status
+	}
+
+	if statusMap[server.URL+"/bot-blocked"] != crawler.StatusBlocked {
+		t.Errorf("expected /bot-blocked to have StatusBlocked, got %v", statusMap[server.URL+"/bot-blocked"])
+	}
+	if statusMap[server.URL+"/dead-link"] != crawler.StatusDead {
+		t.Errorf("expected /dead-link to have StatusDead, got %v", statusMap[server.URL+"/dead-link"])
+	}
+	if statusMap[server.URL+"/healthy"] != crawler.StatusOK {
+		t.Errorf("expected /healthy to have StatusOK, got %v", statusMap[server.URL+"/healthy"])
+	}
+}

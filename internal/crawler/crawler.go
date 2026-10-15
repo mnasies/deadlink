@@ -35,7 +35,12 @@ func DefaultConfig() Config {
 // CrawlStats contains metrics collected throughout the crawl lifetime.
 type CrawlStats struct {
 	TotalChecked int           `json:"total_checked"`
-	BrokenCount  int           `json:"broken_count"`
+	OKCount      int           `json:"ok_count"`
+	DeadCount    int           `json:"dead_count"`
+	BlockedCount int           `json:"blocked_count"`
+	TimeoutCount int           `json:"timeout_count"`
+	ErrorCount   int           `json:"error_count"`
+	BrokenCount  int           `json:"broken_count"` // Number of broken links (DeadCount + ErrorCount)
 	Duration     time.Duration `json:"duration_ms"`
 }
 
@@ -127,7 +132,11 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 	visited[canonicalStart] = struct{}{}
 
 	var allResults []Result
-	brokenCount := 0
+	okCount := 0
+	deadCount := 0
+	blockedCount := 0
+	timeoutCount := 0
+	errorCount := 0
 	inFlight := 0
 
 	for {
@@ -147,7 +156,12 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 			wg.Wait()
 			return &CrawlStats{
 				TotalChecked: len(allResults),
-				BrokenCount:  brokenCount,
+				OKCount:      okCount,
+				DeadCount:    deadCount,
+				BlockedCount: blockedCount,
+				TimeoutCount: timeoutCount,
+				ErrorCount:   errorCount,
+				BrokenCount:  deadCount + errorCount,
 				Duration:     time.Since(start),
 			}, allResults, ctx.Err()
 
@@ -159,8 +173,23 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 			inFlight--
 			allResults = append(allResults, tr.result)
 
-			if tr.result.Broken {
-				brokenCount++
+			switch tr.result.Status {
+			case StatusOK:
+				okCount++
+			case StatusDead:
+				deadCount++
+			case StatusBlocked:
+				blockedCount++
+			case StatusTimeout:
+				timeoutCount++
+			case StatusError:
+				errorCount++
+			default:
+				if tr.result.Broken {
+					deadCount++
+				} else {
+					okCount++
+				}
 			}
 
 			if onResult != nil {
@@ -197,7 +226,12 @@ func (c *Crawler) Crawl(ctx context.Context, rawStartURL string, onResult func(R
 
 				return &CrawlStats{
 					TotalChecked: len(allResults),
-					BrokenCount:  brokenCount,
+					OKCount:      okCount,
+					DeadCount:    deadCount,
+					BlockedCount: blockedCount,
+					TimeoutCount: timeoutCount,
+					ErrorCount:   errorCount,
+					BrokenCount:  deadCount + errorCount,
 					Duration:     time.Since(start),
 				}, allResults, nil
 			}

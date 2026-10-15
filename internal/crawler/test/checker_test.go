@@ -303,3 +303,211 @@ func TestLinkChecker_RedirectsAndLoops(t *testing.T) {
 		}
 	})
 }
+
+func TestClassifyStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		err        error
+		header     http.Header
+		expected   crawler.LinkStatus
+	}{
+		{
+			name:       "200 OK is StatusOK",
+			statusCode: http.StatusOK,
+			expected:   crawler.StatusOK,
+		},
+		{
+			name:       "204 No Content is StatusOK",
+			statusCode: http.StatusNoContent,
+			expected:   crawler.StatusOK,
+		},
+		{
+			name:       "301 Redirect is StatusOK",
+			statusCode: http.StatusMovedPermanently,
+			expected:   crawler.StatusOK,
+		},
+		{
+			name:       "404 Not Found is StatusDead",
+			statusCode: http.StatusNotFound,
+			expected:   crawler.StatusDead,
+		},
+		{
+			name:       "410 Gone is StatusDead",
+			statusCode: http.StatusGone,
+			expected:   crawler.StatusDead,
+		},
+		{
+			name:       "403 Forbidden is StatusBlocked (bot protection / WAF)",
+			statusCode: http.StatusForbidden,
+			expected:   crawler.StatusBlocked,
+		},
+		{
+			name:       "429 Too Many Requests is StatusBlocked (rate limiting / bot throttling)",
+			statusCode: http.StatusTooManyRequests,
+			expected:   crawler.StatusBlocked,
+		},
+		{
+			name:       "401 Unauthorized is StatusBlocked",
+			statusCode: http.StatusUnauthorized,
+			expected:   crawler.StatusBlocked,
+		},
+		{
+			name:       "451 Unavailable For Legal Reasons is StatusBlocked",
+			statusCode: http.StatusUnavailableForLegalReasons,
+			expected:   crawler.StatusBlocked,
+		},
+		{
+			name:       "Cloudflare 503 challenge is StatusBlocked",
+			statusCode: http.StatusServiceUnavailable,
+			header:     http.Header{"Server": []string{"cloudflare"}},
+			expected:   crawler.StatusBlocked,
+		},
+		{
+			name:       "Standard 503 Service Unavailable is StatusError",
+			statusCode: http.StatusServiceUnavailable,
+			header:     http.Header{"Server": []string{"nginx"}},
+			expected:   crawler.StatusError,
+		},
+		{
+			name:       "500 Internal Server Error is StatusError",
+			statusCode: http.StatusInternalServerError,
+			expected:   crawler.StatusError,
+		},
+		{
+			name:       "502 Bad Gateway is StatusError",
+			statusCode: http.StatusBadGateway,
+			expected:   crawler.StatusError,
+		},
+		{
+			name:       "504 Gateway Timeout is StatusTimeout",
+			statusCode: http.StatusGatewayTimeout,
+			expected:   crawler.StatusTimeout,
+		},
+		{
+			name:       "408 Request Timeout is StatusTimeout",
+			statusCode: http.StatusRequestTimeout,
+			expected:   crawler.StatusTimeout,
+		},
+		{
+			name:     "context.DeadlineExceeded error is StatusTimeout",
+			err:      context.DeadlineExceeded,
+			expected: crawler.StatusTimeout,
+		},
+		{
+			name:     "ErrRedirectLoop is StatusDead",
+			err:      crawler.ErrRedirectLoop,
+			expected: crawler.StatusDead,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := crawler.ClassifyStatus(tt.statusCode, tt.err, tt.header)
+			if got != tt.expected {
+				t.Errorf("ClassifyStatus(%d, %v, %v) = %v; want %v", tt.statusCode, tt.err, tt.header, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestLinkChecker_BotProtectionAndGranularStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/protected-403":
+			// Persistent 403 on both HEAD and GET
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("Access Denied - Bot Protection"))
+
+		case "/rate-limited-429":
+			// Persistent 429
+			w.WriteHeader(http.StatusTooManyRequests)
+
+		case "/cloudflare-challenge":
+			w.Header().Set("Server", "cloudflare")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("Just a moment... Cloudflare challenge"))
+
+		case "/dead-404":
+			w.WriteHeader(http.StatusNotFound)
+
+		case "/server-500":
+			w.WriteHeader(http.StatusInternalServerError)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	checker := crawler.NewLinkChecker(server.Client(), "deadlink-test/1.0")
+	checker.SetRetryPolicy(1, 5*time.Millisecond)
+
+	t.Run("403 Forbidden is classified as StatusBlocked without being marked Broken", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/protected-403", "https://example.com")
+		if res.Status != crawler.StatusBlocked {
+			t.Errorf("expected StatusBlocked, got %v", res.Status)
+		}
+		if !res.IsBlocked() {
+			t.Errorf("expected res.IsBlocked() == true")
+		}
+		if res.Broken {
+			t.Errorf("expected Broken == false for bot protection block, got true")
+		}
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("expected status 403, got %d", res.StatusCode)
+		}
+	})
+
+	t.Run("429 Too Many Requests is classified as StatusBlocked after retries", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/rate-limited-429", "https://example.com")
+		if res.Status != crawler.StatusBlocked {
+			t.Errorf("expected StatusBlocked, got %v", res.Status)
+		}
+		if !res.IsBlocked() {
+			t.Errorf("expected res.IsBlocked() == true")
+		}
+		if res.Broken {
+			t.Errorf("expected Broken == false for rate limit, got true")
+		}
+	})
+
+	t.Run("Cloudflare 503 challenge is classified as StatusBlocked", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/cloudflare-challenge", "https://example.com")
+		if res.Status != crawler.StatusBlocked {
+			t.Errorf("expected StatusBlocked for Cloudflare challenge, got %v", res.Status)
+		}
+		if !res.IsBlocked() {
+			t.Errorf("expected res.IsBlocked() == true")
+		}
+		if res.Broken {
+			t.Errorf("expected Broken == false for Cloudflare challenge, got true")
+		}
+	})
+
+	t.Run("404 Not Found is classified as StatusDead and Broken", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/dead-404", "https://example.com")
+		if res.Status != crawler.StatusDead {
+			t.Errorf("expected StatusDead, got %v", res.Status)
+		}
+		if !res.IsDead() {
+			t.Errorf("expected res.IsDead() == true")
+		}
+		if !res.Broken {
+			t.Errorf("expected Broken == true for 404, got false")
+		}
+	})
+
+	t.Run("500 Server Error is classified as StatusError and Broken", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/server-500", "https://example.com")
+		if res.Status != crawler.StatusError {
+			t.Errorf("expected StatusError, got %v", res.Status)
+		}
+		if !res.IsError() {
+			t.Errorf("expected res.IsError() == true")
+		}
+		if !res.Broken {
+			t.Errorf("expected Broken == true for 500 error, got false")
+		}
+	})
+}

@@ -773,9 +773,93 @@ A polite, production-grade crawler must respect the Robots Exclusion Protocol (R
 
 ---
 
+### Chunk 2.6: Multi-State Link Classification & Bot Protection Detection
+**File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go), [`internal/crawler/crawler.go`](../internal/crawler/crawler.go), [`cmd/deadlink/main.go`](../cmd/deadlink/main.go)  
+**Tests**: [`internal/crawler/test/checker_test.go`](../internal/crawler/test/checker_test.go), [`internal/crawler/test/crawler_test.go`](../internal/crawler/test/crawler_test.go), [`cmd/deadlink/test/cli_test.go`](../cmd/deadlink/test/cli_test.go)
+
+#### 1. What was built & Why
+In production environments, a binary `OK` vs `DEAD` link classification produces severe false positives and CI/CD fragility:
+- **Bot Protection & WAFs**: Major services (e.g. Cloudflare, AWS WAF, Akamai, Twitter/X, LinkedIn) return `403 Forbidden`, `429 Too Many Requests`, or `503 Service Unavailable` with challenge headers (`Server: cloudflare`, `cf-mitigated: challenge`) when probed by automated tools. These URLs are not broken or dead; automated scrapers are simply barred.
+- **Network Timeouts**: Network congestion, dropped packets, or slow backends cause connection/read timeouts (`context.DeadlineExceeded`, `504 Gateway Timeout`). Conflating transient network latency with a dead 404 URL misleads developers.
+- **Granular Classification Engine (`ClassifyStatus`)**:
+  - Replaces the binary `Broken` flag with `LinkStatus`:
+    - `StatusOK` (`"OK"`): 2xx / 3xx responses.
+    - `StatusDead` (`"DEAD"`): Definitively dead (404, 410, DNS NXDOMAIN `no such host`, `ECONNREFUSED`, `ErrRedirectLoop`, `ErrTooManyRedirects`).
+    - `StatusBlocked` (`"BLOCKED"`): Access blocked by bot protections or auth challenges (403, 429, 401, 451, Cloudflare JS challenges).
+    - `StatusTimeout` (`"TIMEOUT"`): Network timeouts (`context.DeadlineExceeded`, `net.Error.Timeout()`, 504 Gateway Timeout, 408 Request Timeout).
+    - `StatusError` (`"ERROR"`): Server 5xx faults (500, 502, 503) or socket resets (`ECONNRESET`, broken pipe).
+- **CLI & CI/CD Safety**:
+  - Streaming output displays dedicated status tags: `[ OK ]`, `[DEAD]`, `[BLOCKED]`, `[TIMEOUT]`, `[ERROR]`.
+  - Non-dead blocked links do NOT cause CI builds to fail by default.
+  - Optional strict flags: `--fail-on-blocked` and `--fail-on-timeout` allow CI pipelines to selectively enforce zero tolerance if desired.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Type-Safe String Enumerations via Custom Type
+- Go lacks algebraic sum types (`enum` in Rust or `std::variant` in C++).
+- Idiomatic Go defines a named type over an underlying primitive (such as `string` or `int`):
+  ```go
+  type LinkStatus string
+
+  const (
+      StatusOK      LinkStatus = "OK"
+      StatusDead    LinkStatus = "DEAD"
+      StatusBlocked LinkStatus = "BLOCKED"
+      StatusTimeout LinkStatus = "TIMEOUT"
+      StatusError   LinkStatus = "ERROR"
+  )
+  ```
+- This yields compiler-checked type safety while serializing directly into human-readable JSON strings (`"status": "BLOCKED"`) without manual string conversions.
+
+##### Deep Error Inspection via `errors.As` and `net.Error`
+- Network errors in Go are wrapped in nested layers (e.g., `*url.Error` wrapping `*net.OpError` wrapping `syscall.Errno`).
+- Go 1.13+ `errors.As` unrolls the error chain to check interface implementations:
+  ```go
+  var netErr net.Error
+  if errors.As(err, &netErr) && netErr.Timeout() {
+      return StatusTimeout
+  }
+  ```
+- This allows deterministic timeout detection regardless of how deeply wrapped the underlying socket error is.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `type LinkStatus string` | `enum class LinkStatus` with string conversion | `#[derive(Serialize, Deserialize)] enum LinkStatus` |
+| `errors.As(err, &netErr)` | `dynamic_cast<const std::system_error&>(e)` | `downcast_ref::<io::Error>()` / `match err.kind()` |
+| `r.IsBlocked()` | Helper member function on struct | Member method on `Result` enum or struct |
+
+---
+
+#### 4. API Inventory & Stage 2 Complete
+
+- **Types & Enums**:
+  - `LinkStatus string`: Enum representing `StatusOK`, `StatusDead`, `StatusBlocked`, `StatusTimeout`, `StatusError`.
+- **Struct Updates**:
+  - `Result.Status LinkStatus`: Classified status of the probe.
+  - `CrawlStats.OKCount`, `DeadCount`, `BlockedCount`, `TimeoutCount`, `ErrorCount int`: Granular metric counters.
+- **Functions & Methods**:
+  - `ClassifyStatus(statusCode int, err error, header http.Header) LinkStatus`: Core classification logic.
+  - `(r Result) IsOK() bool`
+  - `(r Result) IsDead() bool`
+  - `(r Result) IsBlocked() bool`
+  - `(r Result) IsTimeout() bool`
+  - `(r Result) IsError() bool`
+- **CLI Flags**:
+  - `--fail-on-blocked bool`: Flag to fail CI on bot protection blocks (default `false`).
+  - `--fail-on-timeout bool`: Flag to fail CI on network timeouts (default `false`).
+
+---
+
 ### 🎉 Stage 2 Milestone Summary (Robustness Complete)
 - ✅ **Chunk 2.1**: HEAD request probe with automatic GET fallback on 405/501/403.
 - ✅ **Chunk 2.2**: Context timeouts and retries with exponential backoff for transient 429/502/503/504/socket resets.
 - ✅ **Chunk 2.3**: Custom `CheckRedirect` policy with early circular loop detection and hop limit enforcement.
 - ✅ **Chunk 2.4**: Per-host token bucket rate limiting (`golang.org/x/time/rate`).
 - ✅ **Chunk 2.5**: Full RFC 9309 robots.txt compliance and dynamic crawl-delay adaptation.
+- ✅ **Chunk 2.6**: Multi-state link classification (OK, DEAD, BLOCKED, TIMEOUT, ERROR) and bot protection detection.

@@ -44,6 +44,10 @@ In our passive learning sessions, each chunk is built, explained with low-level 
   - Token-bucket rate limiter (`golang.org/x/time/rate`) per domain to avoid slamming target servers.
 - **Chunk 2.5: robots.txt Compliance**
   - Fetch and parse `/robots.txt` before crawling internal paths; respect disallow rules and crawl-delay.
+- **Chunk 2.6: Multi-State Link Classification & Bot Protection Detection** (`internal/crawler/checker.go`, `cmd/deadlink/main.go`)
+  - Granular link categorization beyond binary OK/DEAD: `StatusOK`, `StatusDead`, `StatusBlocked`, `StatusTimeout`, `StatusError`.
+  - Detect aggressive bot protection / WAF blocking (403, 429, Cloudflare challenge) without falsely declaring links dead.
+  - Distinguish network timeouts and server 5xx errors; granular CLI summary metrics and configurable CI failure flags (`--fail-on-blocked`, `--fail-on-timeout`).
 
 ---
 
