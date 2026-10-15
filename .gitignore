@@ -22,3 +22,6 @@ coverage.html
 .env
 .env.local
 .DS_Store
+
+# Agent instructions & notes (local only)
+.agents/

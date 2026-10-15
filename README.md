@@ -14,10 +14,40 @@ Given a URL, `deadlink` crawls the website, identifies all hyperlinks and assets
   - Minimal web server embedding a single-page UI with live Server-Sent Events (SSE) streaming.
 - **Standard Library Core**: Zero heavy web frameworks. Single static binary.
 
-## Development & Stages
+## Installation & Usage
 
-Detailed documentation and stage-by-stage implementation guides for autonomous agents and contributors are available in the [`.agents/`](.agents/) directory:
-- [`.agents/SPEC.md`](.agents/SPEC.md): Full technical specification & requirements
-- [`.agents/STAGES.md`](.agents/STAGES.md): 6-stage development roadmap
-- [`.agents/ARCHITECTURE.md`](.agents/ARCHITECTURE.md): Concurrency, networking, and safety architecture
-- [`.agents/RULES.md`](.agents/RULES.md): Coding rules and educational guidelines
+### Build from source
+```bash
+go build -o deadlink ./cmd/deadlink
+```
+
+### Basic Crawl
+```bash
+./deadlink https://example.com
+```
+
+### Options
+```text
+Usage: deadlink [options] <url>
+
+Options:
+  -concurrency int
+        Number of concurrent worker goroutines (default 10)
+  -max-depth int
+        Maximum link recursion depth for internal pages (default 3)
+  -rate-limit float
+        Maximum requests per second per host (0 = unlimited) (default 10)
+  -timeout duration
+        Network timeout per link probe (default 10s)
+  -ignore-robots
+        Bypass robots.txt restrictions (default false)
+  -fail-on-blocked
+        Treat bot-blocked links (403/429) as CI failures (default false)
+  -fail-on-timeout
+        Treat timed-out links as CI failures (default false)
+```
+
+### Exit Codes
+- `0`: Crawl completed cleanly with no broken/dead links detected.
+- `1`: One or more broken links detected (CI failure signal).
+- `2`: Invalid flags, arguments, or initialization failure.
