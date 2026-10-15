@@ -140,3 +140,80 @@ A web page contains links inside hyperlinks (`<a href="...">`), external stylesh
 
 - **Functions**:
   - `ExtractLinks(baseURL *url.URL, r io.Reader) ([]string, error)`: Streams an HTML document, extracts, resolves, and deduplicates all target URLs from `href` and `src` attributes.
+
+---
+
+### Chunk 1.3: Single Link Prober
+**File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go)  
+**Tests**: [`internal/crawler/checker_test.go`](../internal/crawler/checker_test.go)
+
+#### 1. What was built & Why
+Once URLs are extracted, the crawler needs a dedicated component to probe them over HTTP, measure network latency, detect broken statuses (4xx, 5xx), and capture network-level failures (DNS resolution errors, connection refused, TLS handshake errors, context timeouts).
+- `Result`: Encapsulates the target URL, parent page URL where it was discovered, HTTP status code, duration, error, and a boolean `Broken` flag.
+- `LinkChecker`: Wraps an `*http.Client` and a custom `User-Agent`.
+- `Check(ctx, targetURL, parentURL)`: Executes the HTTP probe with context cancellation support. Drains up to 4KB of the response body to allow TCP connection reuse in Go's Keep-Alive pool, and guarantees socket closure via `defer resp.Body.Close()`.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Struct Methods & Receivers (`func (c *LinkChecker) Check(...)`)
+- Go does not have `class`. Data and behavior are separated:
+  - Struct definition: `type LinkChecker struct { ... }`
+  - Method declaration: `func (c *LinkChecker) Check(...)`
+- `(c *LinkChecker)` is the **method receiver**:
+  - Pointer receiver (`*LinkChecker`): analogous to `this` pointer in C++ or `&mut self` in Rust. Changes mutate the struct, and calling does not copy the struct.
+  - Value receiver (`LinkChecker`): analogous to passing `self` by value in C++ / Rust. A shallow copy of the struct is passed.
+
+##### The `defer` Statement vs. RAII Destructors
+- Go does **not** have C++ destructors or Rust's `Drop` trait.
+- Instead, Go provides `defer`:
+  ```go
+  resp, err := c.client.Do(req)
+  if err != nil {
+      return res
+  }
+  defer resp.Body.Close()
+  ```
+- `defer` registers a function call to execute automatically when the enclosing function returns (even if the function returns early or panics).
+- **Socket File Descriptor Leaks**: In Go's `net/http`, if you do not call `resp.Body.Close()`, the underlying OS socket file descriptor is held open indefinitely by the runtime, eventually causing socket exhaustion (`EMFILE: too many open files`).
+
+##### HTTP Keep-Alive & Body Draining
+- Why `io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))`?
+  - In HTTP/1.1 and HTTP/2, a single TCP connection can be reused for multiple sequential requests.
+  - If a client closes `resp.Body` without reading the response data, the Go HTTP transport cannot reuse the TCP socket; it is forced to close the connection (TCP FIN/RST) and negotiate a brand new 3-way handshake + TLS session for the next request.
+  - Reading a small slice of bytes (up to EOF) allows the connection to be cleanly returned to the `Transport`'s idle pool.
+
+##### `context.Context` (Cancellation & Deadlines)
+- In C++ / Rust, stopping an async or threaded socket call usually requires an atomic boolean, a cancellation token, or dropping the `Future`.
+- In Go, `context.Context` is the standard currency for cancellation trees and timeouts.
+- When `ctx, cancel := context.WithTimeout(..., 20*time.Millisecond)` expires, the context's internal channel `<-ctx.Done()` closes, which causes Go's netpoller to interrupt the socket syscall with `context deadline exceeded`.
+
+##### Testing with `httptest.NewServer`
+- Rather than mocking socket functions or hitting external websites during tests, Go's standard library provides `net/http/httptest.NewServer`.
+- It boots a real local HTTP server on `127.0.0.1` on a random unused OS port, and provides a configured `server.Client()` that routes requests through loopback.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `func (c *LinkChecker) Check()` | Member function `Result LinkChecker::Check()` | `impl LinkChecker { pub fn check(&self) -> Result }` |
+| `defer resp.Body.Close()` | Scope guard / `std::unique_ptr` custom deleter | `impl Drop for Response` (automatic) |
+| `context.Context` | `std::stop_token` (C++20) / cancellation token | `tokio_util::sync::CancellationToken` |
+| `time.Since(start)` | `std::chrono::steady_clock::now() - start` | `Instant::now().elapsed()` |
+| `httptest.NewServer` | In-process test server (e.g. Crow / cpp-httplib) | `wiremock` or in-process `axum` test server |
+
+---
+
+#### 4. API Inventory (Created in Chunk 1.3)
+
+- **Constants**:
+  - `DefaultUserAgent`: Default user-agent string identifying `deadlink`.
+- **Structs**:
+  - `Result`: Encapsulates URL, parent URL, status code, latency duration, error, and broken boolean.
+  - `LinkChecker`: Prober struct managing the `*http.Client` and `User-Agent`.
+- **Functions & Methods**:
+  - `NewLinkChecker(client *http.Client, userAgent string) *LinkChecker`: Constructor with fallback defaults.
+  - `(c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result`: Probes a single URL with context timeout support and socket cleanup.
