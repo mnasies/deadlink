@@ -2,27 +2,28 @@
 
 When working on `deadlink`, adhere strictly to these rules:
 
-1. **Step-by-Step Staging**:
-   - Work strictly within the current stage.
-   - **STOP** after completing each stage so the user can review before proceeding.
-   - Do not jump ahead into subsequent stages without user confirmation.
+1. **Passive Micro-Chunked Workflow**:
+   - Work strictly within the designated micro-chunk (e.g. Chunk 1.1, Chunk 1.2).
+   - Never dump an entire stage or multiple chunks at once.
+   - **STOP** after completing each chunk for user review and inspection before advancing.
 
-2. **Code Simplicity & Readability**:
-   - Write idiomatic Go. Avoid premature abstraction and unnecessary interfaces.
-   - Rely on the standard library whenever possible. Only use the approved dependencies:
-     - `golang.org/x/net/html`
-     - `golang.org/x/time/rate`
+2. **Progress Tracking (`PROGRESS.md`)**:
+   - After completing each chunk, update `PROGRESS.md` with:
+     - What was built and why.
+     - Key Go concepts used (syntax, runtime behavior, idioms).
+     - Rust / C++ analogies (mapping to tokio, mpsc, vtables, epoll, etc.).
+     - Exhaustive list of newly created functions, structs/types, methods, and error types.
 
-3. **Concurrency Documentation**:
-   - For every `go` statement (goroutine) and channel instantiation, provide a concise comment explaining **WHY** it exists, who owns it, and how it is closed or terminated.
+3. **Code Simplicity & Readability**:
+   - Write idiomatic, readable Go. Avoid premature abstraction and unnecessary interfaces.
+   - Stdlib-first. Use approved dependencies (`x/net/html`, `x/time/rate`).
+
+4. **Concurrency & Lifecycle Documentation**:
+   - For every `go` statement (goroutine), channel creation, and mutex lock, provide an inline comment explaining **WHY** it exists, who owns it, and how it is cleaned up or terminated.
    - Prevent goroutine leaks by always coupling goroutines with context cancellation or channel closure.
 
-4. **Educational Explanations**:
-   - After each stage, include a clear, concise educational explanation of the concurrency, Go idioms, and networking concepts implemented during that stage.
-
 5. **Test-Driven & Tested Alongside Code**:
-   - Write tests alongside code for each package.
-   - Use `net/http/httptest` to verify HTTP behavior, status codes, timeouts, redirects, and SSRF guards without hitting external networks during unit tests.
+   - Write tests alongside code using `net/http/httptest` to verify behavior locally without hitting external networks.
 
 6. **Security-First**:
    - SSRF protection, redirect verification, IP pinning, and resource limits are non-negotiable requirements.
