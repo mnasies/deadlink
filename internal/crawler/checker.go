@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -14,16 +15,24 @@ import (
 // DefaultUserAgent sent with link verification probes.
 const DefaultUserAgent = "deadlink/1.0 (+https://github.com/mnasies/deadlink)"
 
+// Sentinel errors for redirect handling.
+var (
+	ErrRedirectLoop      = errors.New("redirect loop detected")
+	ErrTooManyRedirects  = errors.New("too many redirects")
+)
+
 // Result represents the outcome of probing a single link.
 type Result struct {
-	URL        string        `json:"url"`
-	ParentURL  string        `json:"parent_url"`
-	StatusCode int           `json:"status_code"`
-	Duration   time.Duration `json:"duration_ms"`
-	Error      error         `json:"error,omitempty"`
-	Broken     bool          `json:"broken"`
-	MethodUsed string        `json:"method_used,omitempty"` // "HEAD" or "GET" (fallback)
-	Attempts   int           `json:"attempts"`              // Number of probe attempts made (1 + retries)
+	URL           string        `json:"url"`
+	ParentURL     string        `json:"parent_url"`
+	FinalURL      string        `json:"final_url,omitempty"`      // Destination URL after following redirects
+	StatusCode    int           `json:"status_code"`
+	Duration      time.Duration `json:"duration_ms"`
+	Error         error         `json:"error,omitempty"`
+	Broken        bool          `json:"broken"`
+	MethodUsed    string        `json:"method_used,omitempty"`    // "HEAD" or "GET" (fallback)
+	Attempts      int           `json:"attempts"`                 // Number of probe attempts made (1 + retries)
+	RedirectCount int           `json:"redirect_count,omitempty"` // Number of redirect hops followed
 }
 
 // LinkChecker encapsulates the HTTP client and configuration for probing links.
@@ -32,23 +41,42 @@ type LinkChecker struct {
 	userAgent      string
 	maxRetries     int           // Max retry attempts for transient errors (default 2)
 	initialBackoff time.Duration // Base backoff delay (default 100ms)
+	maxRedirects   int           // Max redirect hops allowed (default 10)
 }
 
-// NewLinkChecker constructs a LinkChecker. If client is nil, a sane default is provided.
+// NewLinkChecker constructs a LinkChecker with custom redirect policy and timeout.
 func NewLinkChecker(client *http.Client, userAgent string) *LinkChecker {
+	if userAgent == "" {
+		userAgent = DefaultUserAgent
+	}
+
+	checker := &LinkChecker{
+		userAgent:      userAgent,
+		maxRetries:     2,
+		initialBackoff: 100 * time.Millisecond,
+		maxRedirects:   10,
+	}
+
 	if client == nil {
 		client = &http.Client{
 			Timeout: 10 * time.Second,
 		}
 	}
-	if userAgent == "" {
-		userAgent = DefaultUserAgent
+
+	// Install custom CheckRedirect policy if none is explicitly provided on the client.
+	// This enables early circular redirect loop detection and hop limit enforcement.
+	if client.CheckRedirect == nil {
+		client.CheckRedirect = checker.checkRedirectPolicy
 	}
-	return &LinkChecker{
-		client:         client,
-		userAgent:      userAgent,
-		maxRetries:     2,
-		initialBackoff: 100 * time.Millisecond,
+
+	checker.client = client
+	return checker
+}
+
+// SetRedirectLimit configures the maximum allowed redirect hops.
+func (c *LinkChecker) SetRedirectLimit(maxRedirects int) {
+	if maxRedirects >= 0 {
+		c.maxRedirects = maxRedirects
 	}
 }
 
@@ -62,9 +90,26 @@ func (c *LinkChecker) SetRetryPolicy(maxRetries int, initialBackoff time.Duratio
 	}
 }
 
+// checkRedirectPolicy is an http.Client.CheckRedirect function that tracks redirect
+// history, detects circular redirect loops early, and limits total hops.
+func (c *LinkChecker) checkRedirectPolicy(req *http.Request, via []*http.Request) error {
+	// 1. Enforce maximum redirect hops
+	if len(via) >= c.maxRedirects {
+		return ErrTooManyRedirects
+	}
+
+	// 2. Detect circular loops (e.g. /a -> /b -> /a)
+	incomingURL := req.URL.String()
+	for _, prev := range via {
+		if strings.EqualFold(prev.URL.String(), incomingURL) {
+			return ErrRedirectLoop
+		}
+	}
+
+	return nil
+}
+
 // Check probes targetURL with an HTTP request and returns a Result.
-// It combines a HEAD-first strategy with automatic GET fallback and exponential
-// backoff retries for transient failures (429, 502, 503, 504, connection resets).
 func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Result {
 	start := time.Now()
 	var lastResult Result
@@ -89,7 +134,7 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 			return res
 		}
 
-		// Permanent errors (like 404 Not Found, 410 Gone, 400 Bad Request) must NOT be retried
+		// Permanent errors or fatal redirect loops must NOT be retried
 		if !isTransient(res.StatusCode, res.Error) {
 			return res
 		}
@@ -99,10 +144,9 @@ func (c *LinkChecker) Check(ctx context.Context, targetURL, parentURL string) Re
 			return res
 		}
 
-		// Calculate backoff delay with exponential scaling: initial * 2^attempt
+		// Exponential backoff delay
 		delay := c.initialBackoff * (1 << attempt)
 
-		// Context-aware sleep: unblocks immediately if ctx is canceled during backoff
 		select {
 		case <-time.After(delay):
 			// Proceed to next retry attempt
@@ -129,6 +173,9 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 	if err == nil {
 		res.StatusCode = resp.StatusCode
 		res.MethodUsed = http.MethodHead
+		res.FinalURL = resp.Request.URL.String()
+		res.RedirectCount = calculateRedirects(resp.Request)
+
 		c.drainAndClose(resp.Body)
 
 		if resp.StatusCode < 400 {
@@ -141,6 +188,12 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 			res.Broken = true
 			return res
 		}
+	} else if isRedirectError(err) {
+		// Redirect loops or max redirects abort immediately with clean unwrapped errors
+		res.Error = unwrapRedirectError(err)
+		res.Broken = true
+		res.MethodUsed = http.MethodHead
+		return res
 	}
 
 	// 2. Fall back to GET
@@ -148,7 +201,9 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 	res.MethodUsed = http.MethodGet
 
 	if getErr != nil {
-		if err != nil {
+		if isRedirectError(getErr) {
+			res.Error = unwrapRedirectError(getErr)
+		} else if err != nil {
 			res.Error = err
 		} else {
 			res.Error = getErr
@@ -157,11 +212,13 @@ func (c *LinkChecker) probeOnce(ctx context.Context, targetURL, parentURL string
 		return res
 	}
 
+	res.FinalURL = getResp.Request.URL.String()
+	res.RedirectCount = calculateRedirects(getResp.Request)
+
 	// Check for Retry-After header on 429 responses if available
 	if getResp.StatusCode == http.StatusTooManyRequests {
 		if retryAfter := getResp.Header.Get("Retry-After"); retryAfter != "" {
 			if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 {
-				// Cap maximum header sleep to 5s to avoid holding workers forever
 				if seconds > 5 {
 					seconds = 5
 				}
@@ -198,13 +255,43 @@ func (c *LinkChecker) drainAndClose(body io.ReadCloser) {
 	_ = body.Close()
 }
 
+// calculateRedirects estimates the number of redirects taken by checking request context.
+// In Go net/http, resp.Request is the final request after following redirects.
+// If resp.Request.Response is present, each chained response indicates one redirect hop.
+func calculateRedirects(req *http.Request) int {
+	hops := 0
+	curr := req
+	for curr != nil && curr.Response != nil {
+		hops++
+		curr = curr.Response.Request
+	}
+	return hops
+}
+
+// isRedirectError tests whether err is caused by a redirect loop or exceeding redirect limits.
+func isRedirectError(err error) bool {
+	return errors.Is(err, ErrRedirectLoop) || errors.Is(err, ErrTooManyRedirects)
+}
+
+// unwrapRedirectError extracts the underlying ErrRedirectLoop or ErrTooManyRedirects
+// from Go's *url.Error wrapper.
+func unwrapRedirectError(err error) error {
+	if errors.Is(err, ErrRedirectLoop) {
+		return ErrRedirectLoop
+	}
+	if errors.Is(err, ErrTooManyRedirects) {
+		return ErrTooManyRedirects
+	}
+	return err
+}
+
 // shouldFallbackToGET returns true if the status code suggests the server
 // does not support or rejects HEAD requests, but might accept GET.
 func shouldFallbackToGET(statusCode int) bool {
 	switch statusCode {
 	case http.StatusMethodNotAllowed, // 405
 		http.StatusNotImplemented,    // 501
-		http.StatusForbidden:         // 403 (many CDNs block HEAD)
+		http.StatusForbidden:         // 403
 		return true
 	default:
 		return false
@@ -214,22 +301,23 @@ func shouldFallbackToGET(statusCode int) bool {
 // isTransient determines whether a failure is transient (warranting a retry)
 // or permanent (such as 404 Not Found, which should never be retried).
 func isTransient(statusCode int, err error) bool {
-	// Transient HTTP status codes
+	// Redirect errors are permanent structural failures
+	if isRedirectError(err) {
+		return false
+	}
+
 	switch statusCode {
-	case http.StatusTooManyRequests,     // 429 Rate limited
-		http.StatusBadGateway,          // 502 Upstream glitch
-		http.StatusServiceUnavailable,  // 503 Overloaded
-		http.StatusGatewayTimeout:       // 504 Timeout
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
 		return true
 	}
 
-	// Network-level transient socket errors
 	if err != nil {
-		// Connection resets (ECONNRESET) or broken pipes
 		if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return true
 		}
-		// Go net.Error with Timeout() or Temporary()
 		var netErr net.Error
 		if errors.As(err, &netErr) && (netErr.Timeout()) {
 			return true

@@ -228,3 +228,78 @@ func TestLinkChecker_RetriesAndBackoff(t *testing.T) {
 		}
 	})
 }
+
+func TestLinkChecker_RedirectsAndLoops(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect-1":
+			http.Redirect(w, r, server.URL+"/redirect-2", http.StatusMovedPermanently)
+		case "/redirect-2":
+			http.Redirect(w, r, server.URL+"/destination", http.StatusFound)
+		case "/destination":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("Destination content"))
+
+		case "/loop-a":
+			http.Redirect(w, r, server.URL+"/loop-b", http.StatusFound)
+		case "/loop-b":
+			http.Redirect(w, r, server.URL+"/loop-a", http.StatusFound)
+
+		case "/chain-1":
+			http.Redirect(w, r, server.URL+"/chain-2", http.StatusFound)
+		case "/chain-2":
+			http.Redirect(w, r, server.URL+"/chain-3", http.StatusFound)
+		case "/chain-3":
+			http.Redirect(w, r, server.URL+"/chain-4", http.StatusFound)
+		case "/chain-4":
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	checker := crawler.NewLinkChecker(nil, "deadlink-test/1.0")
+
+	t.Run("successful multi-hop redirect resolution", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/redirect-1", "https://example.com")
+		if res.Broken {
+			t.Fatalf("expected redirect chain to succeed, got broken: %+v", res)
+		}
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", res.StatusCode)
+		}
+		if res.RedirectCount != 2 {
+			t.Errorf("expected 2 redirect hops, got %d", res.RedirectCount)
+		}
+		expectedFinal := server.URL + "/destination"
+		if res.FinalURL != expectedFinal {
+			t.Errorf("expected final URL %q, got %q", expectedFinal, res.FinalURL)
+		}
+	})
+
+	t.Run("detect circular redirect loop early", func(t *testing.T) {
+		res := checker.Check(context.Background(), server.URL+"/loop-a", "https://example.com")
+		if !res.Broken {
+			t.Fatalf("expected redirect loop to be marked broken, got %+v", res)
+		}
+		if res.Error == nil || !strings.Contains(res.Error.Error(), "redirect loop detected") {
+			t.Errorf("expected ErrRedirectLoop, got %v", res.Error)
+		}
+	})
+
+	t.Run("enforce maximum redirect limit", func(t *testing.T) {
+		limitedChecker := crawler.NewLinkChecker(nil, "deadlink-test/1.0")
+		limitedChecker.SetRedirectLimit(2) // max 2 hops; /chain-1 -> /chain-2 -> /chain-3 -> /chain-4 requires 3 hops
+
+		res := limitedChecker.Check(context.Background(), server.URL+"/chain-1", "https://example.com")
+		if !res.Broken {
+			t.Fatalf("expected exceeding redirect limit to be broken, got %+v", res)
+		}
+		if res.Error == nil || !strings.Contains(res.Error.Error(), "too many redirects") {
+			t.Errorf("expected ErrTooManyRedirects, got %v", res.Error)
+		}
+	})
+}

@@ -577,3 +577,66 @@ However, naively retrying every failure causes massive delays: retrying a `404 N
 - **Methods Added**:
   - `(c *LinkChecker) SetRetryPolicy(maxRetries int, initialBackoff time.Duration)`: Configures retry bounds.
   - `isTransient(statusCode int, err error) bool`: Categorizes whether a failure is retryable.
+
+---
+
+### Chunk 2.3: Redirect Control & Loop Detection
+**File**: [`internal/crawler/checker.go`](../internal/crawler/checker.go)  
+**Tests**: [`internal/crawler/test/checker_test.go`](../internal/crawler/test/checker_test.go)
+
+#### 1. What was built & Why
+Websites frequently move or alias content using HTTP redirects (`301 Moved Permanently`, `302 Found`, `307 Temporary Redirect`, `308 Permanent Redirect`).
+However, misconfigured server routing rules frequently cause two severe issues:
+1. **Infinite Circular Redirect Loops** (e.g. `/a` -> `/b` -> `/a`): Standard HTTP clients loop until hitting an arbitrary maximum hop count (e.g., 10 hops), wasting time and socket connections.
+2. **Endless Redirect Chains**: Links bouncing across 15+ domains.
+- **Custom `CheckRedirect` Engine**:
+  - Intercepts every single HTTP redirect hop.
+  - **Early Circular Detection**: Compares the incoming target URL against every previously visited URL in the redirect history (`via []*http.Request`). If a URL repeats, it halts immediately on that hop with `ErrRedirectLoop`.
+  - **Hop Limit Enforcement**: Limits total hops to `maxRedirects` (default 10, configurable via `SetRedirectLimit`).
+  - **Redirect Telemetry**: Populates `Result.FinalURL` (where the request ultimately landed) and `Result.RedirectCount` (number of hops followed).
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### The `http.Client.CheckRedirect` Hook
+- In C++ (libcurl), redirect handling is typically configured via flags like `CURLOPT_FOLLOWLOCATION` and `CURLOPT_MAXREDIRS`.
+- In Rust (`reqwest`), it is managed via `reqwest::redirect::Policy`.
+- In Go, `http.Client` provides a first-class function pointer:
+  ```go
+  CheckRedirect func(req *http.Request, via []*http.Request) error
+  ```
+  - `req`: The upcoming redirect request about to be sent.
+  - `via`: A slice containing all previous `*http.Request` instances in order of execution.
+  - Returning `nil` tells the Go runtime to follow the redirect.
+  - Returning an error halts further redirects; `client.Do()` wraps the returned error inside a `*url.Error` and returns it.
+
+##### Reconstructing Redirect Chains via `req.Response`
+- When Go follows redirects, `resp.Request` represents the **final** request that produced `resp`.
+- Each request in the chain holds a reference to the response that caused it:
+  `req.Response -> previousReq.Response -> ...`
+- We implemented `calculateRedirects(req)` by walking this linked list backward to determine the exact number of hops without allocating extra tracking slices.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `CheckRedirect` | Custom libcurl redirect callback | `reqwest::redirect::Policy::custom(...)` |
+| `ErrRedirectLoop` | Cycle detection in directed graph (`std::unordered_set` of visited URIs) | `reqwest::redirect::Policy::Action::Stop` on cycle |
+| `calculateRedirects` | Traversing reverse linked list `req->response->request` | Inspecting response chain |
+
+---
+
+#### 4. API Inventory (Updated in Chunk 2.3)
+
+- **Sentinel Errors**:
+  - `ErrRedirectLoop = errors.New("redirect loop detected")`: Returned when a URL in the redirect chain points back to a previously visited hop.
+  - `ErrTooManyRedirects = errors.New("too many redirects")`: Returned when the redirect count reaches `maxRedirects`.
+- **Struct Updates**:
+  - `Result.FinalURL string`: Final destination URL after following redirect hops.
+  - `Result.RedirectCount int`: Count of redirect hops followed.
+- **Methods Added**:
+  - `(c *LinkChecker) SetRedirectLimit(maxRedirects int)`: Configures maximum allowed redirect hops.
+  - `(c *LinkChecker) checkRedirectPolicy(req *http.Request, via []*http.Request) error`: Internal hook for hop counting and loop detection.
