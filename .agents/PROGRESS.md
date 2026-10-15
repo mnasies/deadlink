@@ -70,3 +70,73 @@ In web crawling, deduplication is paramount. If you visit `https://example.com/a
   - `NormalizeURL(rawURL string) (string, error)`: Normalizes casing, strips fragments, cleans trailing slashes.
   - `ResolveURL(base *url.URL, ref string) (string, error)`: Resolves any relative/absolute reference against a base URL and normalizes it.
   - `IsInternal(baseURL, targetURL *url.URL) bool`: Returns `true` if both URLs share the exact same hostname (case-insensitive).
+
+---
+
+### Chunk 1.2: HTML Link Extractor
+**File**: [`internal/crawler/extract.go`](../internal/crawler/extract.go)  
+**Tests**: [`internal/crawler/extract_test.go`](../internal/crawler/extract_test.go)
+
+#### 1. What was built & Why
+A web page contains links inside hyperlinks (`<a href="...">`), external stylesheets (`<link href="...">`), scripts (`<script src="...">`), and embedded assets (`<img src="...">`).
+- `ExtractLinks`: Consumes an incoming HTML byte stream (`io.Reader`), tokenizes the HTML on-the-fly, extracts all `href` and `src` attributes, resolves them relative to the base URL using `ResolveURL`, and returns a deduplicated slice of absolute URLs.
+- **Architectural Decision (Streaming vs DOM Tree)**:
+  - `html.Parse(r)` builds a complete hierarchical DOM tree where every tag is an `*html.Node` struct allocated on the heap. For a crawler fetching thousands of pages, this causes heavy garbage collection churn.
+  - `html.NewTokenizer(r)` is a zero-to-low allocation streaming pull-parser (similar to an SAX/StAX parser in XML, or a byte-level lexer). It reads chunk-by-chunk from the `io.Reader`, avoiding DOM tree allocations.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### The `io.Reader` Interface
+- In Go, `io.Reader` is defined as:
+  ```go
+  type Reader interface {
+      Read(p []byte) (n int, err error)
+  }
+  ```
+- Any type providing a `Read([]byte) (int, error)` method automatically satisfies `io.Reader` without explicitly declaring it (structural typing / implicit interface).
+- This means `ExtractLinks` does not care whether bytes come from:
+  - An HTTP socket response body (`resp.Body`)
+  - An in-memory buffer (`strings.NewReader` or `bytes.Buffer`)
+  - A file on disk (`os.File`)
+- In C++, this is equivalent to passing `std::istream&`. In Rust, it is equivalent to accepting `impl std::io::Read`.
+
+##### Zero-Size Struct Sets (`map[string]struct{}`)
+- Go does not have a built-in `Set` type in its standard library.
+- Idiomatic Go uses `map[K]struct{}`.
+- `struct{}` is an empty struct. In the Go runtime, `unsafe.Sizeof(struct{}{}) == 0` bytes.
+- Unlike `map[string]bool` (which consumes 1 extra byte of memory for every value boolean in the bucket array), `map[string]struct{}` occupies zero value storage in memory buckets.
+- Idiom:
+  ```go
+  seen[url] = struct{}{}      // Insert into set
+  if _, exists := seen[url]; !exists { ... } // Membership check
+  ```
+
+##### The Infinite Loop (`for { ... }`)
+- Go has only one looping keyword: `for`.
+- `for { ... }` is an infinite loop (equivalent to `while (true)` in C++ or `loop { ... }` in Rust).
+- Loops are broken via `break`, `return`, or labels.
+
+##### `io.EOF` as Stream Termination
+- In Go stream processing, `io.EOF` ("End Of File") is a sentinel error returned by readers when no more bytes remain.
+- It is treated not as a fatal failure, but as a normal stream completion signal: `if errors.Is(err, io.EOF) { return links, nil }`.
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `io.Reader` interface | `std::istream&` / abstract `IByteStream` | `std::io::Read` trait object |
+| `html.NewTokenizer(r)` | Lexer / SAX streaming parser | `html5ever::tokenizer` / pull parser |
+| `map[string]struct{}` | `std::unordered_set<std::string>` | `std::collections::HashSet<String>` |
+| `struct{}` (zero-size type) | `struct Empty {}; sizeof(Empty) == 1` (in C++ empty structs are at least 1 byte; in Go they are 0 bytes) | `()` unit type / zero-sized type (ZST) |
+| `switch tokenType` | `switch (tokenType)` | `match token_type` |
+
+---
+
+#### 4. API Inventory (Created in Chunk 1.2)
+
+- **Functions**:
+  - `ExtractLinks(baseURL *url.URL, r io.Reader) ([]string, error)`: Streams an HTML document, extracts, resolves, and deduplicates all target URLs from `href` and `src` attributes.
