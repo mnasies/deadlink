@@ -15,8 +15,8 @@ dist/
 coverage.html
 
 # Project binaries
-deadlink
-server
+/deadlink
+/server
 
 # Environment / local files
 .env

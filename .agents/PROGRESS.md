@@ -318,3 +318,76 @@ A naive recursive crawler easily suffers from two catastrophic concurrency failu
   - `DefaultConfig() Config`: Conservative default crawler settings.
   - `NewCrawler(cfg Config, checker *LinkChecker) *Crawler`: Factory constructor.
   - `(c *Crawler) Crawl(ctx context.Context, startURL string, onResult func(Result)) (*CrawlStats, []Result, error)`: Executes full recursive crawl with bounded concurrency, deduplication, and streaming result callbacks.
+
+---
+
+### Chunk 1.5: CLI Entrypoint & Terminal Summary
+**File**: [`cmd/deadlink/main.go`](../cmd/deadlink/main.go)  
+**Tests**: [`cmd/deadlink/test/cli_test.go`](../cmd/deadlink/test/cli_test.go)
+
+#### 1. What was built & Why
+A library is only as useful as its interface. In Chunk 1.5, we implemented the CLI binary entrypoint (`deadlink`):
+- Accepts `--concurrency`, `--max-depth`, and `--timeout` flags via standard `flag` package.
+- Streams live progress to stdout as links are checked (`[ OK ] 200` or `[DEAD] 404`).
+- Implements graceful signal cancellation: hitting `Ctrl+C` does not kill the process abruptly; it cancels the crawl context, flushes the summary of links checked so far, and exits cleanly.
+- Implements CI/CD-friendly exit codes:
+  - `0`: Clean crawl (all checked links alive).
+  - `1`: One or more broken links found (triggers build failure in GitHub Actions / GitLab CI).
+  - `2`: Invalid CLI flags or missing target URL.
+
+---
+
+#### 2. Go Concepts Explained (from a C++ / Rust perspective)
+
+##### Testable CLI Architecture (`main()` vs `run(...) int`)
+- In Go, `os.Exit(code)` terminates the entire OS process immediately without running deferred functions (`defer`). Calling `os.Exit` inside test functions would abort the test suite.
+- Idiomatic pattern:
+  ```go
+  func main() {
+      os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+  }
+  func run(args []string, stdout, stderr io.Writer) int { ... }
+  ```
+- By injecting `stdout` and `stderr` as `io.Writer` interfaces and returning an exit code integer, the entire CLI logic can be tested deterministically with in-memory buffers (`bytes.Buffer`).
+
+##### `flag.FlagSet` vs Global `flag.Parse()`
+- Go provides a global `flag.Parse()` package, but globals hinder isolation across tests.
+- We construct an isolated parser: `flags := flag.NewFlagSet("deadlink", flag.ContinueOnError)`.
+- We redirect output via `flags.SetOutput(stderr)`.
+
+##### Graceful Signal Cancellation (`signal.NotifyContext`)
+- In C++, handling `SIGINT` / `SIGTERM` requires registering a signal handler with `sigaction()` and setting an atomic flag (`std::atomic<bool>`).
+- In Rust Tokio, one listens for `tokio::signal::ctrl_c()`.
+- In Go:
+  ```go
+  ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+  defer stop()
+  ```
+  The Go runtime spins up an internal goroutine listening to OS signals. When `SIGINT` (Ctrl+C) or `SIGTERM` arrives, the runtime closes `ctx.Done()`. This transparently propagates cancellation down into `crawler.Crawl` and `checker.Check`, cleanly unblocking network syscalls and worker loops.
+
+##### End-to-End Binary Testing with `os/exec`
+- In `cmd/deadlink/test/cli_test.go`, we compile the binary once using `exec.Command("go", "build", ...)`, boot an `httptest.Server`, and spawn sub-processes to verify that the compiled binary produces exact stdout formatting and process exit codes (`0`, `1`, `2`).
+
+---
+
+#### 3. C++ / Rust Mental Model Mapping
+
+| Go Concept | C++ Analogy | Rust Analogy |
+|---|---|---|
+| `flag.FlagSet` | `boost::program_options` / `CLI11` | `clap` parser |
+| `signal.NotifyContext` | POSIX `sigaction` + `std::stop_source` (C++20) | `tokio::signal::ctrl_c()` |
+| `run(args, stdout, stderr)` | `int cli_main(std::span<string_view>, std::ostream&, std::ostream&)` | `fn run(args: &[String], stdout: &mut dyn Write) -> ExitCode` |
+| `os.Exit(code)` | `std::exit(code)` | `std::process::exit(code)` |
+| `exec.Command` | `fork()` + `execvp()` / `boost::process` | `std::process::Command` |
+
+---
+
+#### 4. API Inventory (Created in Chunk 1.5)
+
+- **Constants**:
+  - `ExitClean = 0`: Process exit code when 0 broken links are found.
+  - `ExitBroken = 1`: Process exit code when 1 or more broken links are found.
+  - `ExitFailure = 2`: Process exit code for invalid CLI arguments or setup failure.
+- **Functions**:
+  - `main()`: Process entrypoint.
+  - `run(args []string, stdout, stderr io.Writer) int`: Testable CLI executor with flag parsing, signal handling, and summary generation.
